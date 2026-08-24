@@ -1,0 +1,28 @@
+# Trivy 例外清单。
+#
+# ⚠️ 只允许放「已核实不适用」的条目，且必须写明：为什么不适用、怎么复核。
+# 一条没有依据的 ignore，等于把整个扫描变成摆设 —— 下一个人会照着加第二条。
+
+# GO-2026-5932 · golang.org/x/crypto/openpgp 已无人维护、设计上不安全
+#
+# 不适用的依据：本项目只用同一模块下的 bcrypt
+# （internal/store/user.go、internal/store/admin.go 做密码哈希），
+# 没有任何代码路径引用 openpgp。Trivy 按 module 粒度报告，而漏洞在 package 粒度。
+#
+# 2026-08-19 复核（推 yourorg 前），三条证据一致：
+#   go list -deps ./... | grep -c openpgp          → 0
+#   strings <二进制> | grep -c x/crypto/openpgp    → 0（本机 arm64 与镜像内 amd64 都是 0）
+#   govulncheck ./...                              → openpgp 落在
+#     "modules you require, but your code doesn't appear to call" 一栏
+#
+# 🔴 复核时别用 `govulncheck -mode=binary`：它没有源码信息，只能按**模块**判定，
+#    会把该 advisory 声明的全部符号（armor/clearsign/elgamal/…）列成
+#    "Vulnerable symbols found"，看着像真的链进去了。
+#    实际 strings 里一个都没有。要判可达性，必须用源码模式。
+#    （某个同类产品 记过另一个同名假阳性：miekg/dns 的 OPENPGPKEY 是 DNS 记录类型，
+#      与 x/crypto/openpgp 无关。这个名字前后绕过两次人了。）
+#
+# 该 advisory 永远不会有 fixed version（上游明确不再维护），
+# 所以这不是"暂时豁免"，是长期结论。若哪天真需要 openpgp，
+# 必须删掉这条例外并另找库。
+GO-2026-5932

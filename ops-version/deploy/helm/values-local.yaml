@@ -1,0 +1,122 @@
+requireEnvValues: false
+
+nameOverride: ""
+fullnameOverride: ""
+
+global:
+  imageRegistry: registry.example.com/ops
+
+  tag: ""
+  imagePullSecrets: []
+
+frontend:
+  replicaCount: 1
+
+  image:
+    repository: ops-version-frontend
+    tag: ""
+    pullPolicy: IfNotPresent
+
+  service:
+    type: NodePort
+    port: 80
+    nodePort: 30837
+
+  resources:
+    requests:
+      cpu: 50m
+      memory: 64Mi
+    limits:
+      cpu: 200m
+      memory: 192Mi
+
+  autoscaling:
+    enabled: false
+    minReplicas: 2
+    maxReplicas: 4
+    targetCPUUtilizationPercentage: 70
+    targetMemoryUtilizationPercentage: 70
+
+  podDisruptionBudget:
+    enabled: false
+    minAvailable: 1
+
+backend:
+  replicaCount: 1
+
+  image:
+    repository: ops-version-backend
+    tag: ""
+    pullPolicy: IfNotPresent
+
+  service:
+    port: 8080
+    metricsPort: 8088
+
+  resources:
+    requests:
+      cpu: 100m
+      memory: 256Mi
+    limits:
+      cpu: 1000m
+      memory: 1Gi
+
+  autoscaling:
+    enabled: false
+    minReplicas: 2
+    maxReplicas: 4
+    targetCPUUtilizationPercentage: 70
+    targetMemoryUtilizationPercentage: 70
+
+  podDisruptionBudget:
+    enabled: false
+    minAvailable: 1
+
+  envFrom:
+    - secretRef:
+        name: ops-version-backend-secret
+
+
+metrics:
+  enabled: false
+  scrapeKind: ServiceMonitor
+  labels: {}
+  path: /metrics
+  interval: 30s
+  scrapeTimeout: 10s
+  relabelings: []
+
+proxyTimeoutSeconds: 120
+
+podAntiAffinity:
+  enabled: true
+  required: false
+
+nodeSelector: {}
+tolerations: []
+podAnnotations: {}
+
+ingress:
+  enabled: false
+  className: ""
+  annotations: {}
+  hosts:
+    - host: opsversion.example.com
+      paths:
+        - path: /
+          pathType: Prefix
+  tls: []
+
+istio:
+  enabled: false
+  annotations: {}
+  gateways: []
+  hosts: []
+  matchPrefix:
+    - "/"
+  timeout: 180s
+  retries:
+    attempts: 3
+    perTryTimeout: 60s
+    retryOn: connect-failure,refused-stream
+    allowUnsafeRetryOn: false

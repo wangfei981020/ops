@@ -1,0 +1,23 @@
+# 共享包 + 各产品的前端。
+#
+# 产品目录形态是 ops-<产品>/{frontend,backend,deploy}，一个产品的前后端在一起；
+# 而 packages/ 是跨产品共享的前端基建（设计系统、i18n、三态组件、license 门控）。
+#
+# 为什么共享包不放进某个产品目录：五个产品要共用同一套设计系统与 i18n，
+# 放在任一产品下都会让其他产品反向依赖它，依赖图立刻成环。
+packages:
+  - "packages/*"
+  - "ops-*/frontend"
+# pnpm 11 起，带 postinstall 的依赖必须显式批准，防止供应链攻击靠安装脚本落地。
+# 只放行确实需要编译原生产物的包，其余一律不批。
+allowBuilds:
+  esbuild: true
+
+# ⚠️ overrides 必须写在这里，不能写 package.json 的 pnpm 字段 ——
+# pnpm 11 起不再读那个字段，写在那儿会被**静默忽略**（只有一行 WARN），
+# 而 audit 依旧报同一个漏洞，看起来像"改了没用"。
+overrides:
+  # GHSA-5p4m-2wfm-xmqj：@redocly/openapi-core 钉死 4.3.0。
+  # 只是构建期依赖（openapi-typescript 生成 API 类型），不进产物也不进镜像，
+  # 但规矩是 audit 清零，不留"这个可以忽略"的先例
+  js-yaml: ^4.3.1

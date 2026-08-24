@@ -1,0 +1,135 @@
+requireEnvValues: false
+
+nameOverride: ""
+fullnameOverride: ""
+
+global:
+  imageRegistry: harbor.example.com/devops
+
+  tag: ""
+
+  imagePullSecrets:
+    - name: ops-harbor-login-secret
+
+frontend:
+  replicaCount: 1
+
+  image:
+    repository: ops-version-frontend
+    tag: ""
+    pullPolicy: IfNotPresent
+
+  service:
+    type: ClusterIP
+    port: 80
+    nodePort: null
+
+  resources:
+    requests:
+      cpu: 100m
+      memory: 128Mi
+    limits:
+      cpu: 200m
+      memory: 256Mi
+
+  autoscaling:
+    enabled: false
+    minReplicas: 2
+    maxReplicas: 5
+    targetCPUUtilizationPercentage: 70
+    targetMemoryUtilizationPercentage: 70
+
+  podDisruptionBudget:
+    enabled: false
+    minAvailable: 1
+
+backend:
+  replicaCount: 1
+
+  image:
+    repository: ops-version-backend
+    tag: ""
+    pullPolicy: IfNotPresent
+
+  service:
+    port: 8080
+    metricsPort: 8088
+
+  resources:
+    requests:
+      cpu: 200m
+      memory: 256Mi
+    limits:
+      cpu: 1000m
+      memory: 1Gi
+
+  autoscaling:
+    enabled: false
+    minReplicas: 2
+    maxReplicas: 6
+    targetCPUUtilizationPercentage: 70
+    targetMemoryUtilizationPercentage: 70
+
+  podDisruptionBudget:
+    enabled: false
+    minAvailable: 1
+
+  envFrom:
+    - secretRef:
+        name: ops-version-backend-secret
+
+
+metrics:
+  enabled: true
+
+  scrapeKind: ServiceMonitor
+
+  labels:
+    release: kube-prometheus-stack
+
+  path: /metrics
+  interval: 30s
+  scrapeTimeout: 10s
+  relabelings: []
+
+proxyTimeoutSeconds: 120
+
+podAntiAffinity:
+  enabled: true
+  required: true
+
+nodeSelector: {}
+tolerations: []
+podAnnotations: {}
+
+ingress:
+  enabled: false
+  className: ""
+  annotations: {}
+  hosts:
+    - host: opsversion.example.com
+      paths:
+        - path: /
+          pathType: Prefix
+  tls: []
+
+istio:
+  enabled: true
+  annotations: {}
+
+  gateways:
+    - istio-system/infra-istio-ingressgateway-inner
+
+  hosts:
+    - opsversion.example.com
+
+  matchPrefix:
+    - "/"
+
+  timeout: 180s
+
+  retries:
+    attempts: 3
+    perTryTimeout: 60s
+    retryOn: connect-failure,refused-stream
+    allowUnsafeRetryOn: false

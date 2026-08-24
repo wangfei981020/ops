@@ -1,0 +1,6 @@
+apiVersion: v2
+name: ops-version
+description: OpsVersion 多组织版本对账 —— 前后端同一个 chart，一次发布、一次回滚
+type: application
+version: 0.1.0
+appVersion: "0.1.0"

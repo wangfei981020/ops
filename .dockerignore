@@ -1,0 +1,21 @@
+# 构建上下文是 ops/ 根目录。
+#
+# ⚠️ node_modules 必须排除，否则 `COPY . .` 会把宿主机的依赖树盖到
+# 容器里已装好的那份上。pnpm 检测到不一致会试图删除重装，
+# 而非 TTY 环境下它不敢自动删，直接报 ERR_PNPM_ABORTED_REMOVE_MODULES_DIR_NO_TTY。
+# 顺带这也是构建慢的主因 —— 传几百 MB 依赖进 daemon 纯属浪费。
+**/node_modules
+**/dist
+**/.turbo
+**/*.tsbuildinfo
+
+.git
+.gitignore
+**/.DS_Store
+
+# 不进镜像：本地预览产物与品牌源文件
+branding/preview.html
+branding/wordmark-preview.html
+
+# 部署物由 helm 用，不需要进镜像
+**/deploy/

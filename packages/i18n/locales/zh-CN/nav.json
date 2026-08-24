@@ -1,0 +1,105 @@
+{
+  "group": {
+    "overview": "概览",
+    "topology": "拓扑",
+    "runtime": "运行",
+    "cost": "成本",
+    "security": "安全与合规",
+    "admin": "管理",
+    "cloud": "计算与网络",
+    "k8s": "集群",
+    "platform": "平台服务",
+    "ingress": "域名与入口"
+  },
+  "overview": {
+    "situation": "全局态势",
+    "clusterHealth": "集群健康"
+  },
+  "topology": {
+    "graph": "资源图谱",
+    "domainChain": "域名链路",
+    "impact": "变更影响面"
+  },
+  "runtime": {
+    "alerts": "告警",
+    "events": "事件",
+    "inspection": "巡检",
+    "diagnostics": "诊断",
+    "eventCenter": "事件中心",
+    "cron": "定时任务",
+    "usage": "资源使用率",
+    "obsQuery": "观测查询"
+  },
+  "cost": {
+    "overview": "成本总览",
+    "attribution": "成本归属",
+    "waste": "闲置与浪费",
+    "recommendations": "优化建议",
+    "rates": "成本单价"
+  },
+  "security": {
+    "exposure": "暴露面",
+    "configAudit": "配置审计",
+    "iamAudit": "云 IAM 审计",
+    "credentials": "凭据管理",
+    "cloudAudit": "云权限审计"
+  },
+  "admin": {
+    "datasources": "数据源",
+    "collectors": "采集任务",
+    "users": "用户与角色",
+    "audit": "审计日志",
+    "notifications": "通知渠道",
+    "license": "授权",
+    "cloudAccounts": "云账号",
+    "obsEndpoints": "观测端点",
+    "sso": "单点登录",
+    "mcp": "AI 接入",
+    "basic": "基础配置",
+    "notify": "通知人",
+    "registrars": "注册商"
+  },
+  "cloud": {
+    "hosts": "主机",
+    "network": "网络与子网",
+    "loadBalancers": "负载均衡",
+    "domains": "域名与证书",
+    "certs": "证书",
+    "ips": "IP 地址",
+    "firewalls": "防火墙"
+  },
+  "k8s": {
+    "clusters": "集群",
+    "nodes": "节点",
+    "namespaces": "命名空间",
+    "workloads": "工作负载",
+    "pods": "Pod",
+    "network": "服务与入口",
+    "storage": "存储卷",
+    "events": "事件",
+    "versionUpgrade": "版本与升级",
+    "clusterEvents": "集群事件",
+    "disruption": "变更前检查"
+  },
+  "platform": {
+    "registry": "镜像仓库",
+    "pipelines": "构建流水线"
+  },
+  "ingress": {
+    "domains": "域名",
+    "dns": "DNS 解析",
+    "cdn": "CDN 站点",
+    "certs": "证书",
+    "hostRecords": "主机头台账"
+  },
+  "search": {
+    "open": "搜索页面",
+    "placeholder": "搜索页面名或分组…",
+    "empty": "没有匹配的页面",
+    "hint": "↑↓ 选择 · ↵ 打开 · esc 关闭"
+  },
+  "sidebar": {
+    "collapse": "收起侧边栏",
+    "expand": "展开侧边栏"
+  }
+}

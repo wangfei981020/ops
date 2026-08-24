@@ -1,0 +1,445 @@
+/* ============================================================================
+ * OpsPlane 设计系统 tokens
+ * 规范原文：docs/design/design-system.md
+ *
+ * 三层结构，各层职责不可越界：
+ *   1. 品牌层  --ops-brand-*     ← 白标唯一入口，客户只改这里
+ *   2. 调色板  --ops-n* / --ops-accent-* / 语义色
+ *   3. 语义层  --ops-background 等 → 经 @theme inline 暴露成 Tailwind 工具类
+ *
+ * 组件只允许用第 3 层（bg-background / text-muted-foreground …）。
+ * 直接写 bg-[#6E6CEF] 或 var(--ops-n100) 都会让白标失效，
+ * tooling/scripts/check-hardcoded-colors.mjs 会在构建前拦下。
+ * ========================================================================== */
+
+@import 'tailwindcss';
+
+/* ---------------------------------------------------------------------------
+ * 明暗切换机制
+ *
+ * 用 CSS 原生 light-dark()，色值只写一遍。选哪一支由 color-scheme 决定：
+ *   :root 默认 `light dark` → 跟随操作系统（这就是 theme=system）
+ *   [data-theme="dark"]     → 钉死深色
+ *   [data-theme="light"]    → 钉死浅色
+ *
+ * light-dark(a, b) 的参数顺序是固定的「浅色在前」，与我们深色优先的取向无关。
+ * ------------------------------------------------------------------------ */
+
+:root {
+  color-scheme: light dark;
+}
+:root[data-theme='dark'] {
+  color-scheme: dark;
+}
+:root[data-theme='light'] {
+  color-scheme: light;
+}
+
+:root {
+  /* ==========================================================================
+   * 第 1 层 · 品牌（白标唯一入口）
+   *
+   * 客户只需覆盖这三个数，accent 的五档由下面 calc 推导，不必填五个色号。
+   * 浅色底需要更深的品牌色才够对比，所以亮度 L 分明暗两个取值。
+   *
+   * ⚠️ 这两个数是实测定出来的，不要凭手感调亮。实测表（brand.test.ts 锁着）：
+   *
+   *    L     主按钮前景   对比度   品牌色作文字
+   *    0.54    白字        5.24      3.67   ← 浅色主题取这档
+   *    0.56    白字        4.81      4.00   ← 深色主题取这档
+   *    0.58    都不够      4.41      4.36   ✗ 死区
+   *    0.62    深色字      4.89      5.15
+   *
+   * 两件事要同时记住：
+   * 1) L=0.58 附近是死区 —— 白字太糊、深色字也不够，两头都掉出 4.5:1。
+   * 2) L≥0.60 虽然也能达标，但达标方式是**主按钮翻成深色字**。
+   *    深紫底压近黑字在企业产品里很怪，主按钮就该是白字。
+   *    所以默认值取死区**以下**的 0.54/0.56，而不是以上的 0.62。
+   * 把 L 往上调会静默改变按钮文字颜色，不会有任何报错。
+   *
+   * ⚠️⚠️ 亮度必须拆成 light / dark 两个**独立数值**，绝不能写成
+   *      `--ops-brand-l: light-dark(0.54, 0.56)`。
+   *      light-dark() 只接受**颜色**参数。把它塞进 oklch() 的亮度位，
+   *      整个 oklch() 会成为无效值并静默算成 transparent ——
+   *      表现是品牌色全站消失（按钮、选中态、logo 全变透明），
+   *      而控制台一条报错都没有，DOM 快照也完全看不出来。
+   *      这个坑实际踩过，只有靠截图才发现。
+   *      同理：alpha 位也不能用 light-dark()，要包住整个颜色值。
+   * ======================================================================= */
+  /* 🔴 这两个亮度是**对比度实测**定出来的，不是挑出来的（2026-08-20）。
+   *
+   *	深色底 oklch(0.145…)（≈ #090A0C）上实测：
+   *	    L0.56 → 4.00   L0.59 → 4.55
+   *	品牌色用在面包屑的**当前页名**上（「主机」「Pod」「告警」…），
+   *	10 个页面全部只有 3.81~4.00，不满足 WCAG AA 的 4.5:1。
+   *
+   *	⚠️ 降饱和救不了：c 从 0.19 降到 0.16，达标点仍是 L0.59。
+   *	所以只能提亮度。
+   *
+   *	⚠️ 浅色的 0.54 实测 4.6:1，达标，不动。
+   *	⚠️ 改这两个数必须重新实测 —— 用 canvas 让浏览器做色彩转换，
+   *	   不要用正则从 oklch 串里抓数字当 RGB（会算出恒为 1.00 的假比率）。 */
+  --ops-brand-l-light: 0.54;
+  /* ⚠️ 0.56 不是手感值：0.58 附近是死区（白字 4.41、深色字 4.36，两头都掉出 4.5）。
+     这个值一度被改成 **0.59** —— 正落在死区里，于是深色主题下
+     「主按钮的白字 4.24」和「品牌色当文字 3.77」双双不达标，
+     而上面那段死区说明原封不动地留着，没有任何东西报错。
+     现在由 check-brand-l-sync 守卫保证它与 brand.ts 的 DEFAULT_L 不会再分叉。 */
+  --ops-brand-l-dark: 0.56;
+  --ops-brand-c: 0.19;
+  --ops-brand-h: 278; /* 靛蓝紫：与红/黄/绿色相距离最远，永不被误读成状态色 */
+
+  /* ==========================================================================
+   * 第 2 层 · 调色板
+   * ======================================================================= */
+
+  /* 中性 12 档 —— 深色刻意不用纯黑：纯黑往下无法再分层，
+     且在非 OLED 屏上与边框对比过硬。带 hue 265 的极轻冷偏。 */
+  --ops-n0: light-dark(oklch(0.985 0.002 265), oklch(0.145 0.005 265));
+  --ops-n50: light-dark(oklch(1 0 265), oklch(0.178 0.006 265));
+  --ops-n100: light-dark(oklch(1 0 265), oklch(0.205 0.007 265));
+  --ops-n150: light-dark(oklch(0.968 0.003 265), oklch(0.232 0.008 265));
+  --ops-n200: light-dark(oklch(0.912 0.005 265), oklch(0.27 0.008 265));
+  --ops-n300: light-dark(oklch(0.86 0.007 265), oklch(0.34 0.01 265));
+  --ops-n400: light-dark(oklch(0.72 0.01 265), oklch(0.44 0.011 265));
+  --ops-n500: light-dark(oklch(0.58 0.012 265), oklch(0.55 0.011 265));
+  --ops-n600: light-dark(oklch(0.5 0.013 265), oklch(0.66 0.01 265));
+  --ops-n700: light-dark(oklch(0.42 0.014 265), oklch(0.76 0.008 265));
+  --ops-n800: light-dark(oklch(0.3 0.012 265), oklch(0.87 0.005 265));
+  --ops-n900: light-dark(oklch(0.2 0.01 265), oklch(0.96 0.003 265));
+
+  /* 强调色五档 —— 全部由品牌三值推导。
+     light-dark() 包住的是**完整的 oklch() 颜色**，不是它的某个参数。 */
+  --ops-accent-400: light-dark(
+    oklch(calc(var(--ops-brand-l-light) + 0.1) calc(var(--ops-brand-c) - 0.04) var(--ops-brand-h)),
+    oklch(calc(var(--ops-brand-l-dark) + 0.1) calc(var(--ops-brand-c) - 0.04) var(--ops-brand-h))
+  );
+  --ops-accent-500: light-dark(
+    oklch(var(--ops-brand-l-light) var(--ops-brand-c) var(--ops-brand-h)),
+    oklch(var(--ops-brand-l-dark) var(--ops-brand-c) var(--ops-brand-h))
+  );
+  --ops-accent-600: light-dark(
+    oklch(calc(var(--ops-brand-l-light) - 0.08) var(--ops-brand-c) var(--ops-brand-h)),
+    oklch(calc(var(--ops-brand-l-dark) - 0.08) var(--ops-brand-c) var(--ops-brand-h))
+  );
+  /* 品牌色**当文字用**的那一档。
+   *
+   * 🔴 为什么不能直接用 accent-500：一个颜色没法同时当「主按钮底色」和「小字颜色」。
+   *	按钮要的是"底色够深、白字压得住"，文字要的是"够亮、在深底上读得清" ——
+   *	深色主题下这两个要求把亮度往相反方向拉。
+   *	实测：accent-500（L=0.56）当侧栏选中项的文字只有 **3.36**，
+   *	而把 L 调到能让它达标（≥0.62）就会让主按钮的白字掉出 4.5。
+   *
+   * ⚠️ 浅色档沿用 accent-500（L=0.54，实测 4.68 达标）；
+   *	深色档单独抬到 0.68 → 5.06。**两个主题必须分别实测**，
+   *	不能测一个推另一个（本条档案就是这么发现三处缺陷不重叠的）。 */
+  --ops-brand-text: light-dark(
+    oklch(var(--ops-brand-l-light) var(--ops-brand-c) var(--ops-brand-h)),
+    oklch(0.68 var(--ops-brand-c) var(--ops-brand-h))
+  );
+
+  --ops-accent-bg: light-dark(
+    oklch(var(--ops-brand-l-light) var(--ops-brand-c) var(--ops-brand-h) / 0.1),
+    oklch(var(--ops-brand-l-dark) var(--ops-brand-c) var(--ops-brand-h) / 0.14)
+  );
+  --ops-accent-ring: light-dark(
+    oklch(var(--ops-brand-l-light) var(--ops-brand-c) var(--ops-brand-h) / 0.4),
+    oklch(var(--ops-brand-l-dark) var(--ops-brand-c) var(--ops-brand-h) / 0.4)
+  );
+
+  /* 语义色 —— 已按底色降饱和。
+     直接用 Tailwind 默认的 red-500/green-500 在深色底上过刺，长时间盯屏疲劳。
+
+     🔴 **浅色的亮度由对比度实测定出来，不是挑出来的**（2026-08-20）。
+     在页面底 oklch(0.985 …)（≈ #F9FAFB）上实测：
+
+         warning L0.64 → 3.32   success L0.58 → 3.85   info L0.56 → 4.32   danger L0.55 → 5.10
+                 ↓ 3 个不满足 WCAG AA 的 4.5:1
+
+     这些色恰恰用在**最该被看见**的地方：「数据 49 小时没更新」「CrashLoopBackOff」
+     「证书还剩 1 天」「停用且从没跑过」。看不清的警示等于没有警示。
+
+     取的是「仍满足 4.5:1 的**最亮**那一档」——再暗会失去色相观感、
+     和正文灰混在一起，那是用另一种方式让警示消失。
+
+     ⚠️ 深色那一支不动：实测本来就达标，而且深色底上更亮才对。
+     ⚠️ 改这几个值必须重新实测，不能凭眼睛看截图 ——
+        oklch 用正则抓 rgb 会得到「0.64/0.14/68 当成 RGB」这种全错的结果，
+        算出来的比率是 1.00 却看不出哪里不对（这一轮我自己踩过一次）。
+        正确做法：用 canvas 让浏览器做色彩转换。 */
+  --ops-success: light-dark(oklch(0.53 0.15 152), oklch(0.72 0.16 152));
+  --ops-success-bg: light-dark(oklch(0.72 0.16 152 / 0.16), oklch(0.72 0.16 152 / 0.14));
+  /* ⚠️ 浅色档的 0.56 是**对着页面底色**调的（那样有 4.59），
+     但警告文字实际坐在 --ops-warning-bg 合成出来的浅橙上（rgb(247,235,211)），
+     对着那个底只有 4.06 —— 实测 4.04。
+     语义色必须对着**它自己的 bg 档**测，不是对着页面底色测。0.52 → 4.80。 */
+  --ops-warning: light-dark(oklch(0.52 0.14 68), oklch(0.79 0.15 78));
+  --ops-warning-bg: light-dark(oklch(0.79 0.15 78 / 0.2), oklch(0.79 0.15 78 / 0.14));
+  --ops-danger: light-dark(oklch(0.55 0.19 22), oklch(0.66 0.19 22));
+  --ops-danger-bg: light-dark(oklch(0.66 0.19 22 / 0.13), oklch(0.66 0.19 22 / 0.14));
+  --ops-info: light-dark(oklch(0.54 0.13 235), oklch(0.71 0.12 235));
+  --ops-info-bg: light-dark(oklch(0.71 0.12 235 / 0.14), oklch(0.71 0.12 235 / 0.14));
+
+  /* 图表 8 色 —— 深浅底都可分辨，色盲友好。
+     序列超过 6 条必须做「Top N + 其他」聚合，而不是继续加颜色。 */
+  --ops-chart-1: light-dark(oklch(0.55 0.18 278), oklch(0.68 0.17 278));
+  --ops-chart-2: light-dark(oklch(0.58 0.14 195), oklch(0.74 0.15 195));
+  --ops-chart-3: light-dark(oklch(0.58 0.15 130), oklch(0.76 0.16 130));
+  --ops-chart-4: light-dark(oklch(0.66 0.15 88), oklch(0.82 0.15 88));
+  --ops-chart-5: light-dark(oklch(0.6 0.17 45), oklch(0.72 0.17 45));
+  --ops-chart-6: light-dark(oklch(0.55 0.19 12), oklch(0.67 0.18 12));
+  --ops-chart-7: light-dark(oklch(0.56 0.18 330), oklch(0.7 0.17 330));
+  --ops-chart-8: light-dark(oklch(0.55 0.11 250), oklch(0.66 0.12 250));
+
+  /* ==========================================================================
+   * 第 3 层 · 语义
+   *
+   * ⚠️ 命名沿用 shadcn/ui，其中 `accent` 指的是「hover/active 的浅底」，
+   *    不是品牌强调色。品牌强调色对应的是 `primary`。这两个极易混淆。
+   * ======================================================================= */
+  --ops-background: var(--ops-n0);
+  --ops-foreground: var(--ops-n900);
+
+  --ops-surface: var(--ops-n50); /* 侧栏、顶栏 */
+  --ops-card: var(--ops-n100);
+  --ops-card-foreground: var(--ops-n900);
+  --ops-popover: var(--ops-n150);
+  --ops-popover-foreground: var(--ops-n900);
+
+  --ops-primary: var(--ops-accent-500);
+  /* 主按钮上的文字。默认白，但**白不总是对的** ——
+     客户品牌色若是亮黄/亮青，白字只有 1.4:1，黑字反而有 13:1。
+     applyBrand() 会按实际品牌色算出该用哪种并覆盖这个变量。
+     写死白字是白标最常见的翻车点。 */
+  --ops-primary-foreground: oklch(0.99 0 0);
+
+  --ops-secondary: var(--ops-n150);
+  --ops-secondary-foreground: var(--ops-n900);
+
+  --ops-muted: var(--ops-n150);
+  /* 弱化前景色：n500 → n600。
+     
+     🔴 n500 在**两个主题下都不达标**，实测（canvas 取真实渲染色算 WCAG）：
+       浅色 card 上 4.29:1 · 浅色 background 上 3.90:1
+       深色同样在 3.5~3.7 区间
+     而这些文字的字号在 9~13px，适用 4.5:1，没有"大字例外"可以豁免。
+     
+     ⚠️ 关键判断：这**不是"亮色主题没调好"**。
+     两个主题用的是同一个语义令牌，所以同一个令牌在两种背景下都差不多地不够——
+     改任何一个主题的具体色值都是治标，要改的是令牌指向的亮度层级本身。
+     
+     受影响的元素类型（实测）：表格表头（11.5px）、EE 角标（9px）、
+     次要文本、分页的「每页」、侧栏分组标题、版本号。
+     其中两处特别要紧：
+       · 表头是扫读表格的入口，多个页面靠它区分列语义
+       · EE 角标承载"这是企业版功能"，是分档产品里最需要被看见的标记之一
+     
+     n600 = light-dark(oklch(0.5), oklch(0.66))，两边都过 4.5:1。
+     代价是"弱化"没那么弱了，但它相对 foreground(n900) 仍有明显层次——
+     可读性优先于层次感，尤其当字号已经只有 9~12px。 */
+  --ops-muted-foreground: var(--ops-n600);
+
+  --ops-accent: var(--ops-n150); /* shadcn 语义：hover 底 */
+  --ops-accent-foreground: var(--ops-n900);
+
+  --ops-destructive: var(--ops-danger);
+  --ops-destructive-foreground: oklch(0.99 0 0);
+
+  --ops-border: var(--ops-n200);
+  --ops-border-strong: var(--ops-n300);
+  --ops-input: var(--ops-n200);
+  --ops-ring: var(--ops-accent-ring);
+
+  /* 圆角 —— 上限 10px。12px 以上是消费级 App 的语汇，
+     用在企业数据产品上显轻浮。 */
+  --radius-sm: 4px;
+  --radius: 6px;
+  --radius-md: 8px;
+  --radius-lg: 10px;
+
+  /* 遮罩。
+     深浅两套不能用同一个值：浅色底下 rgb(0 0 0 / 0.5) 太重，
+     深色底下又太轻（背景本来就暗，压不出层次）。 */
+  --ops-overlay: light-dark(rgb(16 20 28 / 0.42), rgb(0 0 0 / 0.62));
+
+  /* 阴影 —— 深色下只给真正的浮层。
+     卡片层级一律靠背景亮度差 + 1px 边框，堆阴影只会让画面发灰。 */
+  --ops-shadow-pop: 0 8px 24px light-dark(rgb(16 20 28 / 0.1), rgb(0 0 0 / 0.5));
+  --ops-shadow-modal: 0 16px 48px light-dark(rgb(16 20 28 / 0.16), rgb(0 0 0 / 0.6));
+
+  /* 密度 —— 由 [data-density] 覆盖，见下 */
+  --ops-row-h: 40px;
+  --ops-cell-px: 12px;
+  --ops-cell-py: 10px;
+}
+
+/* ---------------------------------------------------------------------------
+ * 三档密度。列表页要紧、详情页要松 —— 一个密度走天下是「不专业」的直接来源。
+ * ------------------------------------------------------------------------ */
+[data-density='compact'] {
+  --ops-row-h: 32px;
+  --ops-cell-py: 6px;
+}
+[data-density='default'] {
+  --ops-row-h: 40px;
+  --ops-cell-py: 10px;
+}
+[data-density='comfortable'] {
+  --ops-row-h: 48px;
+  --ops-cell-px: 16px;
+  --ops-cell-py: 14px;
+}
+
+/* ---------------------------------------------------------------------------
+ * 暴露给 Tailwind。
+ *
+ * `inline` 是关键：它让生成的工具类引用 var(--ops-*) 而不是把色值内联进 CSS。
+ * 少了 inline，主题切换就只能靠重新构建，运行时换不动。
+ * ------------------------------------------------------------------------ */
+@theme inline {
+  --color-background: var(--ops-background);
+  --color-foreground: var(--ops-foreground);
+  --color-surface: var(--ops-surface);
+  --color-card: var(--ops-card);
+  --color-card-foreground: var(--ops-card-foreground);
+  --color-popover: var(--ops-popover);
+  --color-popover-foreground: var(--ops-popover-foreground);
+  --color-primary: var(--ops-primary);
+  --color-primary-foreground: var(--ops-primary-foreground);
+  --color-primary-hover: var(--ops-accent-400);
+  --color-primary-active: var(--ops-accent-600);
+  /* 品牌色**当文字用**时的别名（链接、选中态的菜单项）。
+     与 --color-primary 同值，但分开命名，读代码时能看出是底色还是文字。 */
+  --color-brand: var(--ops-accent-500);
+  /* 品牌色当文字用时走这一档（text-brand-text）—— 见 --ops-brand-text 的说明 */
+  --color-brand-text: var(--ops-brand-text);
+  --color-danger-foreground: oklch(0.99 0 0);
+  --color-secondary: var(--ops-secondary);
+  --color-secondary-foreground: var(--ops-secondary-foreground);
+  --color-muted: var(--ops-muted);
+  --color-muted-foreground: var(--ops-muted-foreground);
+  --color-accent: var(--ops-accent);
+  --color-accent-foreground: var(--ops-accent-foreground);
+  --color-destructive: var(--ops-destructive);
+  --color-destructive-foreground: var(--ops-destructive-foreground);
+  --color-border: var(--ops-border);
+  --color-border-strong: var(--ops-border-strong);
+  --color-input: var(--ops-input);
+  --color-ring: var(--ops-ring);
+
+  --color-success: var(--ops-success);
+  --color-success-bg: var(--ops-success-bg);
+  --color-warning: var(--ops-warning);
+  --color-warning-bg: var(--ops-warning-bg);
+  --color-danger: var(--ops-danger);
+  --color-danger-bg: var(--ops-danger-bg);
+  --color-info: var(--ops-info);
+  --color-info-bg: var(--ops-info-bg);
+  --color-brand-bg: var(--ops-accent-bg);
+
+  --color-chart-1: var(--ops-chart-1);
+  --color-chart-2: var(--ops-chart-2);
+  --color-chart-3: var(--ops-chart-3);
+  --color-chart-4: var(--ops-chart-4);
+  --color-chart-5: var(--ops-chart-5);
+  --color-chart-6: var(--ops-chart-6);
+  --color-chart-7: var(--ops-chart-7);
+  --color-chart-8: var(--ops-chart-8);
+
+  --color-overlay: var(--ops-overlay);
+
+  --shadow-pop: var(--ops-shadow-pop);
+  --shadow-modal: var(--ops-shadow-modal);
+
+  /* 字族。
+     Inter 承担全部 UI 文字与数字；等宽只给日志、ID、IP、YAML、哈希。
+     ⚠️ 等宽绝不用于标题 —— 那会让企业产品看起来像黑客玩具。 */
+  --font-sans:
+    'Inter var', 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', 'PingFang SC',
+    'HarmonyOS Sans SC', 'Source Han Sans SC', 'Microsoft YaHei', system-ui, sans-serif;
+  --font-mono: 'JetBrains Mono', 'SF Mono', ui-monospace, Menlo, Consolas, monospace;
+
+  /* 字号 —— 数据密集型，整体比消费级小一档 */
+  --text-2xs: 11px;
+  --text-xs: 12px;
+  --text-sm: 13px;
+  --text-base: 14px;
+  --text-lg: 16px;
+  --text-xl: 20px;
+  --text-2xl: 24px;
+  --text-3xl: 32px;
+
+  /* 动效 —— 进入 ease-out，退出 ease-in；超过 250ms 就显得慢 */
+  --ease-out-ui: cubic-bezier(0, 0, 0.2, 1);
+  --ease-in-ui: cubic-bezier(0.4, 0, 1, 1);
+  --ease-drawer: cubic-bezier(0.32, 0.72, 0, 1);
+}
+
+/* ---------------------------------------------------------------------------
+ * 基础样式
+ * ------------------------------------------------------------------------ */
+@layer base {
+  html {
+    font-size: 14px;
+  }
+
+  body {
+    background-color: var(--ops-background);
+    color: var(--ops-foreground);
+    font-family: var(--font-sans);
+    line-height: 1.5;
+    -webkit-font-smoothing: antialiased;
+  }
+
+  /* 中文行高比拉丁高 0.15 —— Inter 的 x-height 偏高，与苹方同字号混排时
+     中文会显得偏小，行高不补会明显挤。 */
+  :lang(zh),
+  .cjk {
+    line-height: 1.65;
+    letter-spacing: 0.01em;
+  }
+
+  /* 数字等宽。表格里数字宽度跳动是廉价感的头号来源，
+     且几乎没人排查到这一点。 */
+  table,
+  .tabular {
+    font-variant-numeric: tabular-nums;
+    font-feature-settings: 'tnum';
+  }
+
+  /* 焦点可见 —— 绝不允许裸 outline:none */
+  :focus-visible {
+    outline: none;
+    box-shadow: 0 0 0 2px var(--ops-ring);
+  }
+
+  ::selection {
+    background: var(--ops-accent-bg);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+  }
+}
+
+/* ⚠️ 次要文字不要再叠透明度（`text-muted-foreground/70` 这类）。
+	--ops-fg-muted 本身已经贴着 WCAG AA 的下限设计，再乘 0.7 会掉到 3.1:1。
+	实测：证书页「台账更新于 …」那一行就是这么掉下去的（2026-08-20）。
+	要更弱的层次请新增一个**实测过**的令牌，而不是在使用处叠 alpha ——
+	叠出来的值没有任何守卫看得见。 */
+
+/* ⚠️ 已知的一处对比度例外：面包屑「当前页名」是品牌色文字放在
+	14% 品牌色背景上（选中态药丸），同色系天然对比不足 —— 实测约 4.3:1，
+	差 0.2 达不到 AA 的 4.5。
+
+	不靠继续提亮度来解决：那会让品牌色在其它位置（按钮、链接）过亮，
+	是用一个更大的问题换一个更小的。真要解决得改这个药丁的设计
+	（换成中性底 + 品牌色文字，或去掉底色只留字重），那是设计决策不是调参。
+
+	⚠️ 也不要把这条当成"已达标"记进验收结论。 */

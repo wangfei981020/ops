@@ -1,0 +1,33 @@
+{{- include "opsversion.requireEnv" . }}
+{{- if (.Values.metrics | default dict).enabled }}
+{{- $kind := .Values.metrics.scrapeKind -}}
+{{- if not (has $kind (list "ServiceMonitor" "VMServiceScrape")) -}}
+{{- fail (printf "metrics.scrapeKind 只能是 ServiceMonitor 或 VMServiceScrape，当前是 %q" $kind) -}}
+{{- end -}}
+apiVersion: {{ if eq $kind "VMServiceScrape" }}operator.victoriametrics.com/v1beta1{{ else }}monitoring.coreos.com/v1{{ end }}
+kind: {{ $kind }}
+metadata:
+  name: {{ include "opsversion.backend.fullname" . }}
+  labels:
+    {{- include "opsversion.labels" . | nindent 4 }}
+    app.kubernetes.io/component: backend
+    {{- with .Values.metrics.labels }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+spec:
+  namespaceSelector:
+    matchNames:
+      - {{ .Release.Namespace }}
+  selector:
+    matchLabels:
+      {{- include "opsversion.backend.selectorLabels" . | nindent 6 }}
+  endpoints:
+    - port: metrics
+      path: {{ .Values.metrics.path }}
+      interval: {{ .Values.metrics.interval }}
+      scrapeTimeout: {{ .Values.metrics.scrapeTimeout }}
+      {{- with .Values.metrics.relabelings }}
+      relabelings:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+{{- end }}

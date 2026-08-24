@@ -1,0 +1,105 @@
+{
+  "group": {
+    "overview": "Overview",
+    "topology": "Topology",
+    "runtime": "Operations",
+    "cost": "Cost",
+    "security": "Security",
+    "admin": "Administration",
+    "cloud": "Compute & network",
+    "k8s": "Kubernetes",
+    "platform": "Platform services",
+    "ingress": "Domains & ingress"
+  },
+  "overview": {
+    "situation": "Situation",
+    "clusterHealth": "Cluster health"
+  },
+  "topology": {
+    "graph": "Resource graph",
+    "domainChain": "Domain path",
+    "impact": "Change impact"
+  },
+  "runtime": {
+    "alerts": "Alerts",
+    "events": "Events",
+    "inspection": "Inspections",
+    "diagnostics": "Diagnostics",
+    "eventCenter": "Event center",
+    "cron": "Scheduled tasks",
+    "usage": "Resource usage",
+    "obsQuery": "Observability query"
+  },
+  "cost": {
+    "overview": "Cost overview",
+    "attribution": "Attribution",
+    "waste": "Idle & waste",
+    "recommendations": "Recommendations",
+    "rates": "Cost rates"
+  },
+  "security": {
+    "exposure": "Exposure",
+    "configAudit": "Config audit",
+    "iamAudit": "Cloud IAM audit",
+    "credentials": "Credentials",
+    "cloudAudit": "Cloud IAM audit"
+  },
+  "admin": {
+    "datasources": "Data sources",
+    "collectors": "Collectors",
+    "users": "Users & roles",
+    "audit": "Audit log",
+    "notifications": "Notifications",
+    "license": "License",
+    "cloudAccounts": "Cloud accounts",
+    "obsEndpoints": "Observability",
+    "sso": "Single sign-on",
+    "mcp": "AI access",
+    "basic": "Basic settings",
+    "notify": "Notification targets",
+    "registrars": "Registrars"
+  },
+  "cloud": {
+    "hosts": "Hosts",
+    "network": "Networks & subnets",
+    "loadBalancers": "Load balancers",
+    "domains": "Domains & certificates",
+    "certs": "Certificates",
+    "ips": "IP addresses",
+    "firewalls": "Firewalls"
+  },
+  "k8s": {
+    "clusters": "Clusters",
+    "nodes": "Nodes",
+    "namespaces": "Namespaces",
+    "workloads": "Workloads",
+    "pods": "Pods",
+    "network": "Services & ingress",
+    "storage": "Volumes",
+    "events": "Events",
+    "versionUpgrade": "Versions & upgrades",
+    "clusterEvents": "Cluster events",
+    "disruption": "Pre-change checks"
+  },
+  "platform": {
+    "registry": "Image registry",
+    "pipelines": "Build pipelines"
+  },
+  "ingress": {
+    "domains": "Domains",
+    "dns": "DNS records",
+    "cdn": "CDN sites",
+    "certs": "Certificates",
+    "hostRecords": "Hostname ledger"
+  },
+  "search": {
+    "open": "Search pages",
+    "placeholder": "Search by page or group…",
+    "empty": "No matching page",
+    "hint": "↑↓ to move · ↵ to open · esc to close"
+  },
+  "sidebar": {
+    "collapse": "Collapse sidebar",
+    "expand": "Expand sidebar"
+  }
+}

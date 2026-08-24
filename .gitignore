@@ -1,0 +1,17 @@
+node_modules/
+dist/
+.turbo/
+*.tsbuildinfo
+.DS_Store
+.env
+.env.local
+
+# ⚠️ 仓库根的 .gitignore 有 `*.sql`，会吞掉迁移文件。
+# 本目录下如新增 .sql，必须 `git add -f`，否则镜像能跑但 git 里没有。
+# 这里显式反否定，避免再踩一次。
+!**/migrations/*.sql
+
+# 绝不进仓库：任何密钥实体
+*.pem
+*.key
+!**/*.public.key

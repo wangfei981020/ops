@@ -1,0 +1,53 @@
+{{- include "opsversion.requireEnv" . }}
+{{- if (.Values.istio | default dict).enabled }}
+{{- if (.Values.ingress | default dict).enabled }}
+{{- fail "istio.enabled 与 ingress.enabled 不能同时为 true：同一个域名两条入口，实际生效哪条取决于哪个控制器先接管，超时与重试策略却不一样。请只留一个。" }}
+{{- end }}
+{{- if not .Values.istio.gateways }}
+{{- fail "istio.enabled=true 但 istio.gateways 为空。VirtualService 不挂网关等于没有入口 —— 对象能创建成功、域名不通、没有任何报错。请填形如 istio-system/xxx-istio-ingressgateway-inner 的网关。" }}
+{{- end }}
+{{- if not .Values.istio.hosts }}
+{{- fail "istio.enabled=true 但 istio.hosts 为空。没有 host 的 VirtualService 匹配不到任何请求，且不会报错。" }}
+{{- end }}
+{{- $retryOn := .Values.istio.retries.retryOn | default "" }}
+{{- if and (regexMatch "5xx|retriable-status-codes|gateway-error" $retryOn) (not .Values.istio.retries.allowUnsafeRetryOn) }}
+{{- fail (printf "istio.retries.retryOn 含 %q：这类条件会在**应用已经处理过请求之后**重发，对非幂等写（手动触发 Harbor 同步会真的往客户 Harbor 推镜像）等于重复扣款。请只用 connect-failure,refused-stream；确有必要请显式设置 istio.retries.allowUnsafeRetryOn=true。" $retryOn) }}
+{{- end }}
+apiVersion: networking.istio.io/v1
+kind: VirtualService
+metadata:
+  name: {{ include "opsversion.fullname" . }}
+  labels:
+    {{- include "opsversion.labels" . | nindent 4 }}
+  {{- with .Values.istio.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  gateways:
+    {{- range .Values.istio.gateways }}
+    - {{ . | quote }}
+    {{- end }}
+  hosts:
+    {{- range (.Values.istio | default dict).hosts }}
+    - {{ . | quote }}
+    {{- end }}
+  http:
+    - match:
+        {{- range .Values.istio.matchPrefix }}
+        - uri:
+            prefix: {{ . | quote }}
+        {{- end }}
+      route:
+        - destination:
+            host: {{ printf "%s.%s.svc.cluster.local" (include "opsversion.frontend.fullname" .) .Release.Namespace | quote }}
+            port:
+              number: {{ .Values.frontend.service.port }}
+      {{- with .Values.istio.retries }}
+      retries:
+        attempts: {{ .attempts }}
+        perTryTimeout: {{ .perTryTimeout }}
+        retryOn: {{ .retryOn | quote }}
+      {{- end }}
+      timeout: {{ .Values.istio.timeout }}
+{{- end }}

@@ -1,0 +1,58 @@
+OpsVersion 已部署到 {{ .Release.Namespace }}。
+
+  前端    {{ .Values.frontend.replicaCount }} 副本 · {{ .Values.frontend.image.repository }}:{{ include "opsversion.tag" (dict "ctx" . "img" .Values.frontend.image) }}
+  后端    {{ .Values.backend.replicaCount }} 副本 · {{ .Values.backend.image.repository }}:{{ include "opsversion.tag" (dict "ctx" . "img" .Values.backend.image) }}
+  接口    /api/ → {{ include "opsversion.backendAddr" . }}
+
+访问：
+{{- if (.Values.ingress | default dict).enabled }}
+{{- range (.Values.ingress | default dict).hosts }}
+  http{{ if ($.Values.ingress | default dict).tls }}s{{ end }}://{{ .host }}
+{{- end }}
+{{- else if (.Values.istio | default dict).enabled }}
+{{- range (.Values.istio | default dict).hosts }}
+  https://{{ . }}
+{{- end }}
+  经 Istio 网关 {{ join "、" ($.Values.istio | default dict).gateways }}
+
+  ⚠️ VirtualService 创建成功**不代表域名能通**。还要确认两件事，
+     它们出错时都不会有报错，只是访问不到：
+       1. 网关的 listener 允许这个 host（通配 hosts 覆盖不到就静默丢弃）
+          kubectl -n istio-system get gateway -o custom-columns=NAME:.metadata.name,HOSTS:.spec.servers[*].hosts
+       2. 域名解析指向该网关的入口 IP
+{{- else if and (eq .Values.frontend.service.type "NodePort") .Values.frontend.service.nodePort }}
+  http://localhost:{{ .Values.frontend.service.nodePort }}
+
+  ⚠️ Docker Desktop 的 NodePort 不会直接落到 localhost，要经 k8s-proxy 转发。
+     若打不开，先确认 k8s-proxy 里已配了 {{ .Values.frontend.service.nodePort }}：
+       grep {{ .Values.frontend.service.nodePort }} k8s-proxy/nginx.conf k8s-proxy/docker-compose.yml
+     加完端口需要 `docker compose up -d` 重建容器（改 ports 光 reload 不生效）。
+{{- else }}
+  Service 是 ClusterIP。本地验证请改用 values-local.yaml（NodePort + k8s-proxy），
+  不要临时 port-forward —— 端口随机会导致每次验证的地址都不一样。
+{{- end }}
+
+{{- if (.Values.metrics | default dict).enabled }}
+
+⚠️ {{ (.Values.metrics | default dict).scrapeKind }} 已创建，但**建出来不等于被采到**：
+   labels 与采集端的选择器不匹配时，
+   对象照样存在、kubectl get 一切正常、没有任何报错，只是永远没人来抓。
+   必须验证一次：
+     kubectl -n {{ .Release.Namespace }} get {{ ((.Values.metrics | default dict).scrapeKind | default "servicemonitor") | lower }} {{ include "opsversion.backend.fullname" . }} -o jsonpath='{.metadata.labels}'
+{{- end }}
+
+确认各副本实际跑的版本（滚动更新期间会看到新旧并存）：
+  kubectl -n {{ .Release.Namespace }} get pod -l app.kubernetes.io/component=frontend -o name \
+    | xargs -I{} kubectl -n {{ .Release.Namespace }} exec {} -- wget -qO- 127.0.0.1:8080/version.json
+
+  ⚠️ 必须写 127.0.0.1，不能写 localhost：容器里 localhost 同时解析到
+     127.0.0.1 和 ::1，wget 会先试 IPv6，而 nginx 的 `listen 8080` 只绑 IPv4，
+     于是报 Connection refused —— 看起来像服务挂了，其实只是走错了协议族。
+     （探针不受影响，kubelet 用的是 Pod IP。）
+
+{{- $eff := ternary (int .Values.frontend.autoscaling.minReplicas) (int .Values.frontend.replicaCount) .Values.frontend.autoscaling.enabled }}
+{{- if lt $eff 2 }}
+
+⚠️ 前端实际只有 {{ $eff }} 个副本：滚动更新期间会有短暂不可用，且不会创建 PDB。
+   生产请保证至少 2 个（开 HPA 就调 autoscaling.minReplicas，否则调 replicaCount）。
+{{- end }}
