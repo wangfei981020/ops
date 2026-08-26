@@ -260,7 +260,20 @@ export function ImageCheck() {
                         </button>
                       )}
                     </td>
-                    <td className="px-3 py-1.5 font-mono whitespace-nowrap text-foreground">{r.tag}</td>
+                    {/* 🔴 空白 ≠ 没版本。Harbor 按仓库复制时，task 的 resource 写的是
+                        `repo [3 item(s) in total]`，**不带具体 tag** —— 实测过
+                        143 条复制记录 tag 100% 为空。留白的话人会以为是漏渲染，
+                        或者更糟：以为"推的是空版本"。说出来它为什么没有。 */}
+                    <td className="px-3 py-1.5 font-mono whitespace-nowrap text-foreground">
+                      {r.tag || (
+                        <span
+                          className="font-sans text-[11px] text-muted-foreground"
+                          title={t('opsversion:sync.noTagHint')}
+                        >
+                          {t('opsversion:sync.noTag')}
+                        </span>
+                      )}
+                    </td>
                     <td className="px-3 py-1.5 whitespace-nowrap text-muted-foreground">
                       {r.org_name || r.policy_name}
                     </td>

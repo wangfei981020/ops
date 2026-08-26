@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"net/http"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -69,9 +70,12 @@ type envDTO struct {
 	WorkloadExclude []string `json:"workload_exclude"`
 	CompareEnabled  bool     `json:"compare_enabled"`
 	// ProjectID 所属项目。对比表的一列 = 项目 × 环境。0 = 归入该平台的默认项目。
-	ProjectID     int64  `json:"project_id"`
-	Endpoint      string `json:"endpoint"`  // 空 = 继承组织级
-	AuthType      string `json:"auth_type"` // 空 = 继承组织级
+	ProjectID int64 `json:"project_id"`
+	// 环境引用的数据源。0 = 没引用，走下一层（见 store.OrgEnv.Conn）
+	DatasourceID   int64  `json:"datasource_id"`
+	DatasourceName string `json:"datasource_name"`
+	Endpoint       string `json:"endpoint"`  // 空 = 继承平台级
+	AuthType       string `json:"auth_type"` // 空 = 继承平台级
 	HasCredential bool   `json:"has_credential"`
 
 	// ─── 只读：这一列上次采集的结果 ───
@@ -81,6 +85,12 @@ type envDTO struct {
 	LastCollectAt     *time.Time `json:"last_collect_at"`
 	LastCollectStatus string     `json:"last_collect_status"`
 	LastCollectError  string     `json:"last_collect_error"`
+	// LastCollectDegraded 上次采集走了降级路径（读不到 deployments，从 Pod 反推）。
+	// 🔴 同样**只出不进**：这是采集器写的事实，不是用户填的配置。
+	//    进了 Req 就等于允许前端伪造"这一列不是降级采的"，
+	//    而降级恰恰意味着副本为 0 的服务看不见。
+	LastCollectDegraded     bool   `json:"last_collect_degraded"`
+	LastCollectDegradedNote string `json:"last_collect_degraded_note"`
 }
 
 func toDTO(in store.Org, projs []store.Project) orgDTO {
@@ -106,9 +116,11 @@ func toDTO(in store.Org, projs []store.Project) orgDTO {
 			WorkloadInclude: e.WorkloadInclude, WorkloadExclude: e.WorkloadExclude,
 			CompareEnabled: e.CompareEnabled,
 			ProjectID:      e.ProjectID,
+			DatasourceID:   e.DatasourceID, DatasourceName: e.DSName,
 			Endpoint:       e.Endpoint, AuthType: e.AuthType,
 			HasCredential:     e.CredentialEnc != "",
 			LastCollectStatus: e.LastCollectStatus, LastCollectError: e.LastCollectError,
+			LastCollectDegraded: e.LastCollectDegraded, LastCollectDegradedNote: e.LastCollectDegradedNote,
 		}
 		if e.LastCollectAt.Valid {
 			t := e.LastCollectAt.Time
@@ -189,7 +201,11 @@ type envReq struct {
 	WorkloadExclude []string `json:"workload_exclude"`
 	CompareEnabled  bool     `json:"compare_enabled"`
 	ProjectID       int64    `json:"project_id"`
-	Endpoint        string   `json:"endpoint"`
+	// 🔴 环境引用的数据源。客户 UAT / PROD 各一套 Rancher 时选它，
+	//    凭据就只配一处 —— 不必在每个环境行重填一遍账号密码。
+	//    （上面那段注释说的「模型→API→前端 三层一起走」，这个字段就是照着走的。）
+	DatasourceID int64  `json:"datasource_id"`
+	Endpoint     string `json:"endpoint"`
 	AuthType        string   `json:"auth_type"`
 	Username        string   `json:"username"`
 	Password        string   `json:"password"`
@@ -230,6 +246,7 @@ func (s *Server) toInput(req orgReq) (store.OrgInput, error) {
 			WorkloadInclude: e.WorkloadInclude, WorkloadExclude: e.WorkloadExclude,
 			CompareEnabled: e.CompareEnabled,
 			ProjectID:      e.ProjectID,
+			DatasourceID:   e.DatasourceID,
 			Endpoint:       e.Endpoint, AuthType: e.AuthType, CredentialEnc: ec,
 		})
 	}
@@ -269,9 +286,23 @@ func (s *Server) updateOrg(w http.ResponseWriter, r *http.Request) {
 		fail(w, http.StatusInternalServerError, "internal", "凭据加密失败")
 		return
 	}
+	// 🔴 改之前先把旧配置读出来，用于算差异。
+	//    workload_exclude 是这个系统里**杀伤力最大的配置**：改一个字符就能让
+	//    22 个在线服务在对账表上变成「该平台未部署此服务」，
+	//    并往变更历史灌一批假下线。
+	//    而当时的审计只记了 {id, endpoint} —— 那条因果链最后是靠
+	//    「时间戳 + 服务端日志的 services 计数落差 + CMDB 交叉验证」三方拼出来的，
+	//    审计本身给不出答案，而这恰恰是审计该回答的问题。
+	before, beforeErr := s.St.GetOrg(r.Context(), id)
 	_, err = s.St.SaveOrg(r.Context(), id, in)
+	detail := map[string]any{"id": id, "endpoint": req.Endpoint}
+	if beforeErr == nil {
+		if d := ruleDiff(before, req); len(d) > 0 {
+			detail["rule_changes"] = d
+		}
+	}
 	s.St.Audit(r.Context(), userOf(r).Username, "org.update", req.Name,
-		map[string]any{"id": id, "endpoint": req.Endpoint}, err, clientIP(r))
+		detail, err, clientIP(r))
 	if err != nil {
 		fail(w, http.StatusInternalServerError, "internal", err.Error())
 		return
@@ -281,9 +312,19 @@ func (s *Server) updateOrg(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) deleteOrg(w http.ResponseWriter, r *http.Request) {
 	id, _ := strconv.ParseInt(r.PathValue("id"), 10, 64)
+	// 删之前留一份快照：原来 target 只有一个数字 id、详情是 nil ——
+	// 平台一删，审计里连"删掉的是哪个平台"都答不出来。
+	// ⚠️ 只记配置，**绝不记凭据**（envSnapshot 里没有 credential）。
+	gone, goneErr := s.St.GetOrg(r.Context(), id)
+	target := strconv.FormatInt(id, 10)
+	detail := map[string]any{"id": id}
+	if goneErr == nil {
+		target = gone.Name
+		detail["envs"] = envSnapshot(gone)
+	}
 	err := s.St.DeleteOrg(r.Context(), id)
-	s.St.Audit(r.Context(), userOf(r).Username, "org.delete", strconv.FormatInt(id, 10),
-		nil, err, clientIP(r))
+	s.St.Audit(r.Context(), userOf(r).Username, "org.delete", target,
+		detail, err, clientIP(r))
 	if err != nil {
 		fail(w, http.StatusInternalServerError, "internal", err.Error())
 		return
@@ -313,7 +354,7 @@ func (s *Server) probeOrg(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	if !found {
-		fail(w, http.StatusBadRequest, "no_env", "该组织还没有配置任何环境")
+		fail(w, http.StatusBadRequest, "no_env", "该平台还没有配置任何环境")
 		return
 	}
 
@@ -359,7 +400,7 @@ func classifyKind(err error) string {
 	}
 }
 
-// orgClusters 拉这个组织能看到的集群列表，配置环境映射时给用户下拉选。
+// orgClusters 拉这个平台能看到的集群列表，配置环境映射时给用户下拉选。
 // 不用手抄 clusterId（Rancher 的 c-m-xxxx 抄错一个字符就查不到任何东西）。
 func (s *Server) orgClusters(w http.ResponseWriter, r *http.Request) {
 	id, _ := strconv.ParseInt(r.PathValue("id"), 10, 64)
@@ -442,6 +483,14 @@ func (s *Server) collectOrg(w http.ResponseWriter, r *http.Request) {
 	// ⚠️ project 不传 = 该环境下所有项目都采（老调用点、以及「全部采集」）。
 	//    界面上逐列刷新时会带上它。
 	onlyProject, _ := strconv.ParseInt(r.URL.Query().Get("project"), 10, 64)
+	// 🔴 -1 是对账页**平台级列**的标识，语义就是「该环境下的所有项目」，与不传等价。
+	//    不认它的话，下面的过滤 `env.ProjectID != onlyProject` 会把每一个环境都跳过 ——
+	//    采集空转、一条数据都不刷，而调用方拿到的却可能是「成功」。
+	//    前端已经会把平台级列展开成真实项目再刷（见 useFreshness.refreshColumns），
+	//    这里是纵深防御：直接调 API 的客户端不该踩这个坑。
+	if onlyProject == projectAll {
+		onlyProject = 0
+	}
 	err = s.Coll.CollectOrgEnvProject(ctx, in, onlyEnv, onlyProject)
 	s.St.Audit(r.Context(), userOf(r).Username, "org.collect", in.Name,
 		map[string]any{"env": onlyEnv, "project": onlyProject}, err, clientIP(r))
@@ -563,6 +612,35 @@ func (s *Server) buildPlan(r *http.Request, req compareReq) (compare.Plan, int, 
 		//    ⚠️ 老数据（012 迁移前采的）没有环境级记录，回落到平台级，
 		//    否则升级后所有列都会显示成"从未采集"。
 		col := compare.Column{OrgID: in.ID, OrgName: in.Name, Env: c.Env, IsSelf: in.IsSelf}
+
+		// ─── 平台级汇总列 ───
+		//
+		// 🔴 project_id = -1 表示「这一列是整个平台在该环境上的全部项目」。
+		//
+		//    为什么需要这一层：一列 = 项目 × 环境，而同一个服务在两个平台的
+		//    **不同项目**里跑是常态 —— 逐项目比必然大面积「缺失」。
+		//    实测过：5 列逐项目比 = 122 行全判缺失、0 条有效结论；
+		//    换成平台级汇总后是「42 一致 / 22 版本不同 / 8 一方整体未部署」，
+		//    真正要处理的从 122 降到 22，该忽略的从 130 个格子降到 8 个。
+		//
+		// ⚠️ 用 -1 而不是复用 0：0 已经有「按环境回落到默认项目」的语义
+		//    （resolveProject），改它会动到所有既有调用方。
+		// ⚠️ 不调 resolveProject、不设 Filter：跨项目了，某一个项目的
+		//    service_include 不能拿来筛整个平台。
+		if c.ProjectID == projectAll {
+			col.ProjectID = 0 // store 层：0 = 不限项目，查该平台该环境全部
+			col.ProjectName = allProjectsLabel
+			col.Aggregated = true
+
+			col.SyncStatus, col.SyncError, col.SyncedAt = rollUpEnvStatus(in, c.Env)
+			col.Degraded, col.DegradedNote = rollUpDegraded(in, c.Env)
+			if ex, e := s.St.ListExcludedKeys(r.Context(), c.OrgID, 0, c.Env); e == nil {
+				col.ExcludedKeys = ex
+			}
+			plan.Columns = append(plan.Columns, col)
+			continue
+		}
+
 		envProj := int64(0)
 		if env, found := envOf(in, c.Env, c.ProjectID); found {
 			envProj = env.ProjectID
@@ -571,9 +649,15 @@ func (s *Server) buildPlan(r *http.Request, req compareReq) (compare.Plan, int, 
 			col.ProjectID = pr.ID
 			col.Filter = compare.ProjectFilter{Include: pr.ServiceInclude, Pins: pr.ServicePins}
 			// ⚠️ 只有该平台**确实有多个项目**时才把项目名放进表头。
-			//    单项目平台显示成「A公司·默认/UAT」是纯噪音，
+			//    单项目平台显示成「A平台·默认/UAT」是纯噪音，
 			//    而多项目时不显示则是两列同名 —— 分不清哪列是哪个项目。
-			if countEnabledProjects(projByOrg[c.OrgID]) > 1 {
+			//
+			// 🔴 「默认」是建平台时自动生成的占位名，不带任何业务信息 ——
+			//    即使平台下有多个项目，它也不该占表头的位置。
+			//    实际形态是「A公司/UAT」和「A公司·项目B/PROD」并排，
+			//    有名字的那个自然就区分开了；而「A公司·默认/UAT」只是让人多读两个字，
+			//    还会被误读成"有个叫默认的项目"。
+			if countEnabledProjects(projByOrg[c.OrgID]) > 1 && !isPlaceholderProject(pr.Name) {
 				col.ProjectName = pr.Name
 			}
 		}
@@ -587,6 +671,25 @@ func (s *Server) buildPlan(r *http.Request, req compareReq) (compare.Plan, int, 
 			if in.LastSyncAt.Valid {
 				col.SyncedAt = in.LastSyncAt.Time
 			}
+		}
+		// 🔴 把这一列**采集期**的排除规则带给对账引擎。
+		//    不带的话，我方主动不采的服务会被判成「该平台未部署此服务」——
+		//    实测过 22 个 healthy 的服务中过这一枪。
+		// ⚠️ 与上面那段分开取：那段带了 LastCollectStatus != "" 的条件，
+		//    而规则是配置、与这一轮采没采成功无关。
+		if env, found := envOf(in, c.Env, col.ProjectID); found {
+			col.ExcludeRules = env.WorkloadExclude
+			// 降级采集的列，「查不到」只能说"看不见"，不能说"没部署"
+			col.Degraded = env.LastCollectDegraded
+			col.DegradedNote = env.LastCollectDegradedNote
+		}
+		// 🔴 被规则排掉的服务清单 —— 采集时记下的**事实**，优先于拿规则反推。
+		//    查失败不阻断整次对账：那只会让这一列退回反推路径。
+		if ex, e := s.St.ListExcludedKeys(r.Context(), c.OrgID, col.ProjectID, c.Env); e == nil {
+			col.ExcludedKeys = ex
+		} else {
+			logx.Warn("compare", "load_excluded_failed", map[string]any{
+				"col": col.Key(), "err": e.Error()})
 		}
 		plan.Columns = append(plan.Columns, col)
 	}
@@ -665,6 +768,12 @@ func (s *Server) compareHandler(w http.ResponseWriter, r *http.Request) {
 	for k, v := range res.Summary {
 		summary[string(k)] = v
 	}
+	// ⚠️ 只在确实「绝大多数是缺失」时才去找异类列：结果正常时点名一列
+	//    会误导用户取消勾选本该参与对账的数据。
+	worstCol, worstPct := "", 0
+	if mostlyMissing(res) {
+		worstCol, worstPct = worstMissingColumn(res)
+	}
 	ok(w, map[string]any{
 		"columns": plan.Columns,
 		"rows":    rows,
@@ -675,6 +784,10 @@ func (s *Server) compareHandler(w http.ResponseWriter, r *http.Request) {
 		//    不提示的话，人对着一屏灰格子只能自己琢磨，
 		//    而「全是灰的」和「确实没差异」在视觉上很接近。
 		"mostly_missing": mostlyMissing(res),
+		// 指名道姓说出是哪一列拉低了重合度 —— 光说「多半是列选错了」
+		// 只是把问题原样还给用户
+		"worst_overlap_col": worstCol,
+		"worst_overlap_pct": worstPct,
 		// 🔴 单独返回并要求前端显著提示：整列 NoData 时表面上只是几个灰格子，
 		//    但结论已经不完整了 —— 不提示的话用户会拿一份残缺的对账当结论
 		"unhealthy_columns": res.UnhealthyColumns,
@@ -791,6 +904,18 @@ type rulePreviewItem struct {
 	Samples []string `json:"samples"`
 	// Invalid 语法问题的人话说明。空 = 语法没问题。
 	Invalid string `json:"invalid"`
+	// Active 这条规则**已经存在于已保存的配置里**（即：它可能正在生效）。
+	//
+	// 🔴 这个字段是为了打破一个自证循环：
+	//    排除规则一旦生效，被它排掉的服务就不再进快照，而预检的样本正是快照 ——
+	//    于是一条**完全正确、正在排除 22 个服务**的规则，预检会报「命中 0」。
+	//    若据此提示"几乎一定写错了"，用户就会把正确规则改回错的，
+	//    改回去之后服务重新进快照、预检显示"命中 22"，看起来反而"修好了"。
+	//    这会让人在正确与错误配置之间来回摇摆，且每次都得到"看起来正确"的反馈。
+	//
+	// ⚠️ 所以：Active 的规则命中 0 是**正常现象**，不能报警；
+	//    只有**新写的/改过的**规则命中 0 才值得提醒。
+	Active bool `json:"active"`
 }
 
 type rulePreviewResp struct {
@@ -852,22 +977,67 @@ func (s *Server) previewRules(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	keys, err := s.St.ListServiceKeys(r.Context(), id, req.ProjectID, req.Env)
+	// 🔴 样本是「服务名 → 它的 workload 名列表」，匹配时用 **workload 名**。
+	//
+	//    规则是采集期规则，采集器按 workload 名过滤 —— 预检必须用同一个判据。
+	//    拿 ServiceKey 去比规则，在 helm 环境下报的命中与实际排除的**没有交集**：
+	//    实测规则 另一个产品-* 真正排掉的是 另一个产品-plane-*（workload 名匹配），
+	//    而按 ServiceKey 比会报成 另一个产品-backend（它的 workload 是
+	//    opsalert-另一个产品-backend，根本没匹配上，一直在正常采集）——。
+	//
+	// ⚠️ 样本里已并入 excluded_services：被排掉的服务不在快照里，
+	//    不并进来的话已生效的规则永远显示"命中 0"。
+	sample, err := s.St.ListServiceWorkloads(r.Context(), id, req.ProjectID, req.Env)
 	if err != nil {
 		fail(w, http.StatusInternalServerError, "internal", err.Error())
 		return
 	}
+	// 服务名排序后再用，让 samples 的输出稳定 —— 每次点「检查」看到不同的样例
+	// 会让人以为规则变了
+	keys := make([]string, 0, len(sample))
+	for k := range sample {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
 
-	count := func(pats []string) []rulePreviewItem {
+	// matchesRule 这个服务的**任一** workload 名命中规则，就算这条规则会排掉它 ——
+	// 与 providers.WorkloadRules.Match 的语义一致
+	matchesRule := func(pat, svc string) bool {
+		for _, wl := range sample[svc] {
+			if providers.MatchPattern(pat, wl) {
+				return true
+			}
+		}
+		return false
+	}
+
+	// 已保存的规则集合 —— 用来区分「这条已经在生效」和「这条是刚写的」。
+	// ⚠️ 样本已包含被排掉的服务，所以已生效的规则**能**算出真实命中数了；
+	//    Active 现在只用于把"命中 0"的原因说得更准（已保存的规则命中 0
+	//    多半是环境变了，新写的则多半是拼错了）。
+	savedInc, savedExc := map[string]bool{}, map[string]bool{}
+	if env, found := envOf(in, req.Env, req.ProjectID); found {
+		for _, p := range env.WorkloadInclude {
+			savedInc[strings.TrimSpace(p)] = true
+		}
+		for _, p := range env.WorkloadExclude {
+			savedExc[strings.TrimSpace(p)] = true
+		}
+	}
+
+	count := func(pats []string, saved map[string]bool) []rulePreviewItem {
 		out := []rulePreviewItem{}
 		for _, p := range pats {
 			p = strings.TrimSpace(p)
 			if p == "" {
 				continue
 			}
-			it := rulePreviewItem{Pattern: p, Samples: []string{}, Invalid: checkPattern(p)}
+			it := rulePreviewItem{
+				Pattern: p, Samples: []string{}, Invalid: checkPattern(p),
+				Active: saved[p],
+			}
 			for _, k := range keys {
-				if providers.MatchPattern(p, k) {
+				if matchesRule(p, k) {
 					it.Matched++
 					if len(it.Samples) < 3 {
 						it.Samples = append(it.Samples, k)
@@ -879,18 +1049,162 @@ func (s *Server) previewRules(w http.ResponseWriter, r *http.Request) {
 		return out
 	}
 
+	// kept 同样按 workload 名算 —— 与采集器逐字同源
 	rules := providers.WorkloadRules{Include: req.Include, Exclude: req.Exclude}
 	kept := 0
 	for _, k := range keys {
-		if rules.Match(k) {
-			kept++
+		for _, wl := range sample[k] {
+			if rules.Match(wl) {
+				kept++
+				break
+			}
 		}
 	}
 
 	ok(w, rulePreviewResp{
+		// Total 含被规则排掉的那些 —— 它们同样是"这个环境上有的服务"
 		Total:   len(keys),
 		Kept:    kept,
-		Include: count(req.Include),
-		Exclude: count(req.Exclude),
+		Include: count(req.Include, savedInc),
+		Exclude: count(req.Exclude, savedExc),
 	})
+}
+
+// ---------- 平台配置变更的审计详情----------
+
+// envSnapshot 环境级配置的快照，用于审计。
+//
+// 🔴 **只记配置，绝不记凭据**：credential_enc / username / password / api_key
+// 一个都不能进审计。审计日志会被导出、会被更多人看到 ——
+// 全站两个 P0 都是「接口把凭据发给了不该看的人」，这里是同一类风险面。
+func envSnapshot(in store.Org) []map[string]any {
+	out := make([]map[string]any, 0, len(in.Envs))
+	for _, e := range in.Envs {
+		out = append(out, map[string]any{
+			"env": e.Env, "project_id": e.ProjectID,
+			"ns_include": e.NSInclude, "ns_exclude": e.NSExclude,
+			"workload_include": e.WorkloadInclude, "workload_exclude": e.WorkloadExclude,
+			"compare_enabled": e.CompareEnabled,
+		})
+	}
+	return out
+}
+
+// ruleDiff 算出**采集规则**的前后差异，只返回真正变了的那些。
+//
+// 🔴 为什么记差异而不是只记新值：排查时要回答的是「谁把它改成这样的」，
+// 而只有新值的话，看到 `workload_exclude: [*-game-server-backend]` 也无从判断
+// 这次改动到底动了什么 —— 那正是 /043 排查时缺的那块。
+//
+// ⚠️ 按 (env, project_id) 配对，不按下标：环境行的顺序不保证稳定，
+// 按下标比会在增删环境时把两个不相干的环境比在一起，diff 全是噪音。
+func ruleDiff(before store.Org, req orgReq) []map[string]any {
+	type ruleSet struct {
+		nsInc, nsExc, wlInc, wlExc []string
+		compare                    bool
+	}
+	oldBy := map[string]ruleSet{}
+	for _, e := range before.Envs {
+		k := e.Env + "\x00" + strconv.FormatInt(e.ProjectID, 10)
+		oldBy[k] = ruleSet{e.NSInclude, e.NSExclude, e.WorkloadInclude, e.WorkloadExclude, e.CompareEnabled}
+	}
+
+	changes := []map[string]any{}
+	for _, e := range req.Envs {
+		k := e.Env + "\x00" + strconv.FormatInt(e.ProjectID, 10)
+		o, existed := oldBy[k]
+		if !existed {
+			changes = append(changes, map[string]any{
+				"env": e.Env, "project_id": e.ProjectID, "added": true,
+				"ns_include": e.NSInclude, "ns_exclude": e.NSExclude,
+				"workload_include": e.WorkloadInclude, "workload_exclude": e.WorkloadExclude,
+			})
+			continue
+		}
+		delete(oldBy, k)
+		one := map[string]any{"env": e.Env, "project_id": e.ProjectID}
+		add := func(name string, oldV, newV []string) {
+			if !sameStrings(oldV, newV) {
+				one[name] = map[string]any{"from": oldV, "to": newV}
+			}
+		}
+		add("ns_include", o.nsInc, e.NSInclude)
+		add("ns_exclude", o.nsExc, e.NSExclude)
+		add("workload_include", o.wlInc, e.WorkloadInclude)
+		add("workload_exclude", o.wlExc, e.WorkloadExclude)
+		if o.compare != e.CompareEnabled {
+			one["compare_enabled"] = map[string]any{"from": o.compare, "to": e.CompareEnabled}
+		}
+		// 只有 env/project_id 两个键 = 这个环境没动，不记
+		if len(one) > 2 {
+			changes = append(changes, one)
+		}
+	}
+	// 剩下的是被删掉的环境行 —— 同样要记，否则"整个环境被删了"在审计里看不见
+	for k, o := range oldBy {
+		env, _, _ := strings.Cut(k, "\x00")
+		changes = append(changes, map[string]any{
+			"env": env, "removed": true,
+			"workload_exclude": o.wlExc, "ns_include": o.nsInc,
+		})
+	}
+	return changes
+}
+
+func sameStrings(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if strings.TrimSpace(a[i]) != strings.TrimSpace(b[i]) {
+			return false
+		}
+	}
+	return true
+}
+
+// worstMissingColumn 找出**造成最多「缺失」判定**的那一列。
+//
+// 🔴 为什么需要它：对账页默认全选所有列，而各列的采集范围常常差得很远。
+// 实测过：5 列全选 → 122 行 **100% 判缺失**，一条有效结论都没有 ——
+// 这是新用户打开这个产品看到的第一眼。
+// 系统已经会弹「多半是列选错了」，判据也对，但它只说"你去检查一下"。
+// 指名道姓地说出是哪一列、它让多少行变成缺失，才是**可执行**的下一步。
+//
+// ⚠️ 判据用「这一列贡献了多少 missing」，不是「服务名重合度」。
+//
+//	第一版写的是重合度，实测过证明那个维度抓不住元凶：
+//	我方·项目B 只有 13 个服务（全表 122 行），它那 13 个里有 9 个在别列也有 ——
+//	**重合度 69% 很高，可它在 109 行上都是 missing**。
+//	重合度回答的是"这列的服务像不像别人"，而我们要问的是"这列拖累了多少行"。
+//
+// ⚠️ 只数 CellMissing，不数 CellNoData：后者是采集失败或降级采集
+//
+//	（界面另有专门的提示条），把它算进来会指向一列"数据没采到"的，
+//	而那时该做的是修采集，不是取消勾选。
+func worstMissingColumn(res compare.Result) (string, int) {
+	total := len(res.Rows)
+	if total == 0 {
+		return "", 0
+	}
+	missByCol := map[string]int{}
+	for _, row := range res.Rows {
+		for _, c := range row.Cells {
+			if c.State == compare.CellMissing {
+				missByCol[c.Column.Key()]++
+			}
+		}
+	}
+	worstKey, worstN := "", 0
+	for k, n := range missByCol {
+		if n > worstN {
+			worstKey, worstN = k, n
+		}
+	}
+	// 只有当这一列拖累了**过半**的行时才点名。
+	// ⚠️ 阈值不能低：指错一列比不指更糟 —— 用户会取消勾选一列本该参与对账的数据。
+	if worstKey == "" || worstN*100/total < 50 {
+		return "", 0
+	}
+	return worstKey, worstN * 100 / total
 }

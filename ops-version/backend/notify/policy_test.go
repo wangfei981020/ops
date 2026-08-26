@@ -78,8 +78,8 @@ func TestKnownTriggersDoNotWarn(t *testing.T) {
 // 🔴 文案必须写明是手动还是自动：收到的人第一反应是
 // 「这是我刚才点的那次吗」，不写他得去界面比时间戳
 func TestTextSaysTrigger(t *testing.T) {
-	got := Text(LevelFailed, "A公司", "推给A公司", "manual", 10, 8, 2, "wallet:t-114 推送被拒")
-	for _, want := range []string{"手动", "A公司", "推给A公司", "失败 2", "wallet:t-114"} {
+	got := Text(LevelFailed, "A平台", "推给A平台", "manual", 10, 8, 2, "wallet:t-114 推送被拒")
+	for _, want := range []string{"手动", "A平台", "推给A平台", "失败 2", "wallet:t-114"} {
 		if !contains(got, want) {
 			t.Errorf("文案缺少 %q：\n%s", want, got)
 		}

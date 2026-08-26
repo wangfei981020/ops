@@ -39,7 +39,17 @@ const PAIRS = [
     // 发：编辑时读回来。漏字段 = 保存后再打开是空的
     dto: 'envDTO',
     // 只存在于存储层的内部字段
-    skip: ['credential_enc'],
+    //
+    // ⚠️ ds_* 是从 datasources 表 **JOIN 出来的派生值**，不是用户填的：
+    //    用户在界面上选的是 datasource_id，地址/认证方式/凭据由那条数据源提供。
+    //    它们既不该进 Req（前端填了也没意义，会被 JOIN 的值覆盖），
+    //    更不该进 DTO —— 🔴 ds_credential_enc 是**加密后的凭据**，
+    //    出参等于把别的平台也在用的那份凭据发给前端。
+    //    凭据的规矩是「写得进、永不回显」，这条对数据源同样成立。
+    skip: [
+      'credential_enc',
+      'ds_endpoint', 'ds_auth_type', 'ds_credential_enc', 'ds_name', 'ds_provider_type',
+    ],
     // Req 收但 DTO 不发的（凭据类：写得进、永不回显）
     reqOnly: ['username', 'password', 'api_key', 'insecure_tls'],
     // DTO 发但 Req 不收的（派生状态 / 采集器写的事实）
@@ -47,7 +57,13 @@ const PAIRS = [
     // ⚠️ last_collect_* 是**只出不进**的：它们由采集器写，不是用户填的配置。
     //    放进 Req 等于允许前端伪造"采集成功" —— 而那会让一列过期数据
     //    被当成刚采的，比对结果看着正常却是错的。
-    dtoOnly: ['has_credential', 'last_collect_at', 'last_collect_status', 'last_collect_error'],
+    dtoOnly: [
+      'has_credential', 'last_collect_at', 'last_collect_status', 'last_collect_error',
+      // 降级采集标记：同样是采集器写的事实。
+      // 允许前端设置它 = 允许伪造"这一列不是降级采的"，而降级意味着
+      // 副本为 0 的服务看不见，那一列的 missing 全都不该当成确定结论。
+      'last_collect_degraded', 'last_collect_degraded_note',
+    ],
     note: '2026-08-19 栽过：加 workload_include/exclude 时改了迁移/store/providers/collector/前端表单，唯独 envReq 没加，前端填了被静默丢弃',
   },
 ]

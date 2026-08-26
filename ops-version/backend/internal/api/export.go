@@ -17,7 +17,7 @@ import (
 // exportHandler 导出 xlsx。
 //
 // 🔴 导出一律记审计。这份文件会**离开系统**：转发给同事、发进群、发给客户。
-// 事后要能回答「这份表是谁在什么时候导的、含哪几个组织」——
+// 事后要能回答「这份表是谁在什么时候导的、含哪几个平台」——
 // 不记的话，一份泄露出去的对账表根本查不到源头。
 func (s *Server) exportHandler(w http.ResponseWriter, r *http.Request) {
 	req, err := body[compareReq](r)
@@ -123,6 +123,13 @@ func (s *Server) exportInventory(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		OrgID int64  `json:"org_id"`
 		Env   string `json:"env"`
+		// ProjectID 🔴 必须有：一列 = 项目 × 环境。少了它，
+		//    平台页上三个项目各一个「导出清单」链接，点哪个导出的都是
+		//    **同一份跨项目全量** —— 视觉上是三份不同的清单，实际是一份，
+		//    而收到附件的人无从分辨。
+		// ⚠️ 还有个连带后果：ProjectID==0 会走「不限项目」分支，
+		//    导出的清单里会冒出跨项目同名服务的 conflict 标记。
+		ProjectID int64 `json:"project_id"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.OrgID == 0 || req.Env == "" {
 		fail(w, http.StatusBadRequest, "bad_request", "要指定平台与环境")
@@ -143,12 +150,27 @@ func (s *Server) exportInventory(w http.ResponseWriter, r *http.Request) {
 	//    于是 Healthy() 为真、查快照查出空集、**导出一张空表** ——
 	//    而空表跟"这个环境什么都没部署"长得一模一样。
 	//    （环境名靠人手填，写错一个字母就撞上这条路径。）
-	if _, found := envOf(in, req.Env, 0); !found {
+	if _, found := envOf(in, req.Env, req.ProjectID); !found {
 		fail(w, http.StatusBadRequest, "bad_request",
 			"平台 "+in.Name+" 没有名为 "+req.Env+" 的环境")
 		return
 	}
 	col := columnOf(in, req.Env)
+	// 带上项目维度与它的服务过滤规则。
+	// ⚠️ 只设 ProjectID 而不设 Filter 是不够的：零值 ProjectFilter 的 Matches()
+	//    恒为真，service_include 不生效 —— 与 同一个坑。
+	if req.ProjectID != 0 {
+		col.ProjectID = req.ProjectID
+		if ps, e := s.St.ListProjects(r.Context(), in.ID); e == nil {
+			for _, pr := range ps {
+				if pr.ID == req.ProjectID {
+					col.ProjectName = pr.Name
+					col.Filter = compare.ProjectFilter{Include: pr.ServiceInclude, Pins: pr.ServicePins}
+					break
+				}
+			}
+		}
+	}
 	// ⚠️ 采集失败的列**不导**：LoadSnapshots 对不健康的列返回 nil，
 	//    真导出去就是一张空表，而空表跟"这个环境什么都没部署"分不出来。
 	if !col.Healthy() {
@@ -170,8 +192,15 @@ func (s *Server) exportInventory(w http.ResponseWriter, r *http.Request) {
 		// 数据本身的时刻比"上次采集尝试"更准确
 		observed = list[0].ObservedAt
 	}
+	// ⚠️ 平台名要带项目：一个平台三个项目导出三份清单，
+	//    表内标题和文件名都只写「A公司」的话，三份东西完全分不清 ——
+	//    数据修对了，交付物仍然是混的。
+	who := in.Name
+	if col.ProjectName != "" {
+		who = in.Name + "·" + col.ProjectName
+	}
 	blob, err := export.BuildInventory(export.InventoryInput{
-		OrgName: in.Name, Env: req.Env, Services: list,
+		OrgName: who, Env: req.Env, Services: list,
 		ObservedAt: observed, Operator: userOf(r).Username, Now: now,
 	})
 	if err != nil {
@@ -180,11 +209,11 @@ func (s *Server) exportInventory(w http.ResponseWriter, r *http.Request) {
 	}
 	logx.Info("export", "inventory", map[string]any{
 		"org": in.Name, "env": req.Env, "rows": len(list), "user": userOf(r).Username})
-	s.St.Audit(r.Context(), userOf(r).Username, "export.inventory", in.Name+"/"+req.Env,
-		map[string]any{"rows": len(list)}, nil, clientIP(r))
+	s.St.Audit(r.Context(), userOf(r).Username, "export.inventory", col.Key(),
+		map[string]any{"rows": len(list), "project_id": req.ProjectID}, nil, clientIP(r))
 
 	// 🔴 文件名含中文，必须同时给 filename 和 filename*（理由见上面的对账表导出）
-	name := fmt.Sprintf("版本清单_%s_%s_%s.xlsx", in.Name, req.Env, now.Format("20060102_1504"))
+	name := fmt.Sprintf("版本清单_%s_%s_%s.xlsx", who, req.Env, now.Format("20060102_1504"))
 	w.Header().Set("Content-Disposition",
 		fmt.Sprintf(`attachment; filename="inventory.xlsx"; filename*=UTF-8''%s`, url.PathEscape(name)))
 	w.Header().Set("Content-Type",

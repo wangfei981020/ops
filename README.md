@@ -37,7 +37,7 @@
 ```
 ops-version/          版本对账（backend / frontend / deploy）
 packages/             共享前端基建：design（设计令牌）、i18n、ui（三态组件）
-tooling/scripts/      23 道构建期守卫
+tooling/scripts/      21 道构建期守卫
 ```
 
 `ops-version/` 是同级目录里的第一个产品，以后其他产品平级放在旁边，共用 `packages/` 与 `tooling/`。
@@ -47,13 +47,13 @@ tooling/scripts/      23 道构建期守卫
 ```bash
 pnpm install
 pnpm -r --filter './packages/*' build     # 共享包要先编译
-pnpm --filter ops-version-frontend build  # 会先跑 23 道守卫
+pnpm --filter ops-version-frontend build  # 会先跑 21 道守卫
 cd ops-version/backend && go test ./...
 ```
 
 需要 Node 22+、pnpm 11、Go 1.22+、MySQL 8。
 
-## 那 23 道守卫
+## 那 21 道守卫
 
 它们拦的是同一类东西：**不报错、看起来正常、只有用户先撞见**的问题。
 

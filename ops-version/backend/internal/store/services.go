@@ -15,7 +15,9 @@ type CollectedService struct {
 // ⚠️ 带上 envs：同一个服务可能只在 UAT 有、PROD 没有。
 // 勾选时看不到这个，人会以为「勾了就两边都算」，而实际只有一边有。
 func (s *Store) CollectedServices(ctx context.Context, orgID int64, env string) ([]CollectedService, error) {
-	q := `SELECT service_key, env FROM service_versions WHERE org_id=?`
+	// ⚠️ 只看项目级快照（project_id>0）。平台级全量那份会让同一个服务重复出现，
+	//    而这个列表是给人勾选用的 —— 同名两行没人分得清该勾哪个。
+	q := `SELECT service_key, env FROM service_versions WHERE org_id=? AND project_id > 0`
 	args := []any{orgID}
 	if env != "" {
 		q += ` AND env=?`

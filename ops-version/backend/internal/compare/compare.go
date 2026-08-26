@@ -9,13 +9,15 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"ops-version-backend/providers"
 )
 
-// Column 一个对比列 = (组织, 环境)。
+// Column 一个对比列 = (平台, 环境)。
 //
 // 🔴 **不能假设「同环境对同环境」**：有些项目我方只在 UAT 部署、没有 PROD，
 // 需要拿我方 UAT 去比对方的 UAT 和 PROD。列是自由组合，基准也是选出来的其中一列。
-// 一个模型覆盖三种用法：跨公司对账 / 内部晋级检查 / 组织×环境全展开。
+// 一个模型覆盖三种用法：跨平台对账 / 内部晋级检查 / 平台×环境全展开。
 type Column struct {
 	OrgID   int64
 	OrgName string
@@ -23,10 +25,10 @@ type Column struct {
 
 	// ─── 项目 ───
 	//
-	// 一列 = 项目 × 环境。一家公司下常有多个项目，各自要独立的一列。
+	// 一列 = 项目 × 环境。一个平台下常有多个项目，各自要独立的一列。
 	//
 	// ⚠️ ProjectName 留空表示**不必在表头显示项目名** —— 该平台只有一个项目时，
-	//    显示成「A公司·默认/UAT」纯属噪音。是否填由 API 层决定，
+	//    显示成「A平台·默认/UAT」纯属噪音。是否填由 API 层决定，
 	//    引擎只负责「填了就显示」。
 	ProjectID   int64
 	ProjectName string
@@ -39,16 +41,91 @@ type Column struct {
 	// 🔴 归因（"镜像推没推给对方"）的源只能是我方 —— 只有我方的镜像
 	//    才是我们推出去的。原来这个角色由"基准列"兼任，默认基准就是我方；
 	//    没有基准之后必须显式标出来。
-	// ⚠️ 参与列里一个 IsSelf 都没有时（别的两家公司之间对比），
+	// ⚠️ 参与列里一个 IsSelf 都没有时（别的两个平台之间对比），
 	//    归因不成立，要显式说"无法判断"而不是"未同步"。
 	IsSelf bool
 
-	// 该组织最近一次采集的结果。
+	// 该平台最近一次采集的结果。
 	// 🔴 采集失败时整列都是 NoData，**不能让它退化成「这些服务没部署」** ——
 	//    那会把「我们没看到」显示成「对方没有」，是最会骗人的一种错。
 	SyncStatus string // success | auth_failed | unreachable | forbidden | partial | never | error
 	SyncedAt   time.Time
 	SyncError  string
+
+	// ExcludeRules 这一列**采集期**的服务排除规则（org_envs.workload_exclude）。
+	//
+	// 🔴 为什么对账引擎需要知道采集规则：被规则排掉的服务**根本不进快照**，
+	//    到了这里就是"查不到" —— 与"对方确实没部署"在数据上无法区分。
+	//    不带这份规则的话，我方主动不采的服务会被显示成
+	//    「该平台未部署此服务」，而那句话会随导出的 Excel 发给对方公司。
+	//
+	// ⚠️ 这是三分法漏掉的第四种成因。CellNoData / CellMissing 那段注释区分了
+	//    「我们没看到」与「对方确实没有」，但没有覆盖「我们**主动**没看」。
+	ExcludeRules []string
+
+	// Degraded 这一列上次采集走了**降级路径**（读不到 deployments，从 Pod 反推）。
+	//
+	// 🔴 降级列上「查不到某个服务」**不能判成"对方没部署"**：
+	//    副本为 0 的服务在 Pod 层没有任何 Pod，于是采不到 —— 我们是看不见它，
+	//    不是它不存在。而副本缩到 0 是常规运维动作（生产 ls-uat 下就有 5 个）。
+	//    这是「该平台未部署此服务」的第五种成因。
+	Degraded     bool
+	DegradedNote string
+
+	// Aggregated 这一列是**平台级汇总**（把该平台在这个环境上的所有项目滚成一列）。
+	//
+	// 🔴 只影响"怎么说"，不影响"怎么判"：同一个 conflict 状态，
+	//    项目级的成因是「同一项目里多个 workload 版本不一致」，
+	//    平台级的成因是「这个平台的两个项目跑着不同版本」——
+	//    前者要去查 workload 配置，后者要去看哪个项目落后了，方向完全不同。
+	//    说错了会让人往错的方向排查。
+	Aggregated bool
+
+	// ExcludedKeys 这一列**被采集规则实际排掉**的服务（ServiceKey → workload 名）。
+	//
+	// 🔴 这是**事实**，由采集器在过滤那一刻记下并落库，不是拿规则反推的。
+	//    ExcludeRules 那条路径（用 MatchPattern 比 ServiceKey）在 helm 环境下会算错：
+	//    规则比的是 workload 名，而 helm 把 release 名拼进了 workload 名，
+	//    两边命中的根本不是同一批服务。
+	//
+	// ⚠️ 优先用它；为空时才回落到 ExcludeRules 反推 —— 那是给
+	//    「还没用新版采集器采过一轮」的老数据留的过渡路径。
+	ExcludedKeys map[string]string
+}
+
+// ExcludedByRule 这个服务名是不是被本列的采集规则主动排除掉的。
+//
+// ⚠️ 判据必须与采集器同源（providers.MatchPattern）：这里另写一套通配符匹配的话，
+// 会出现「采集器排掉了、对账这边认为没排」的错位，而那种错位只在
+// 通配符写法的边角上出现，极难复现。
+//
+// 🔴 已知前提：**采集层匹配 workload 名，这里匹配 ServiceKey（镜像名最后一段）。**
+//
+//	两者在我们的命名约定下一致，但那是约定不是保证（见 providers.WorkloadRules 的注释）。
+//	一旦某个服务的 workload 名与镜像名不同，就会出现两种偏差：
+//	  · workload 名命中、ServiceKey 不命中 → 它确实没被采到，这里却仍判 missing（回到老问题）
+//	  · ServiceKey 命中、workload 名没命中 → 它其实采到了，这里不会走到（有快照，不进这个分支）
+//	所以偏差只会**退化成修复前的行为**，不会造出新的错误结论 —— 这是可以接受的下界。
+//
+//	⚠️ 根治要求快照层记下「这个服务名被规则排掉了」，而不是靠事后拿规则反推。
+//	   实机验证时确认过：被排除的服务整行都不进结果（两列都没有时），
+//	   所以这条路径只在**非对称配置**下才会被走到。
+func (c Column) ExcludedByRule(serviceKey string) bool {
+	// 有事实就用事实。ExcludedKeys 是采集器在过滤那一刻记下的，
+	// 不受「规则比 workload 名、这里比 ServiceKey」那个错位影响。
+	if len(c.ExcludedKeys) > 0 {
+		_, hit := c.ExcludedKeys[serviceKey]
+		return hit
+	}
+	// 过渡路径：还没用新版采集器采过一轮的列，只能拿规则反推。
+	// ⚠️ helm 环境下这条路径会算错，但它的偏差方向是安全的：
+	//    最坏情况是退回"判 missing"，即修复前的行为，不会造出新的错误结论。
+	for _, p := range c.ExcludeRules {
+		if providers.MatchPattern(p, serviceKey) {
+			return true
+		}
+	}
+	return false
 }
 
 func (c Column) Key() string {
@@ -92,7 +169,7 @@ type Snapshot struct {
 //
 // 🔴 没有基准，所以判定**没有方向**：只能说"这几列彼此一不一样"，
 // 说不了"谁落后谁"。原来那套（behind / ahead / missing_base）全是
-// 相对基准的，而这张表可能是别的两家公司之间的对账，我方根本不在里面 ——
+// 相对基准的，而这张表可能是别的两个平台之间的对账，我方根本不在里面 ——
 // 那时"落后 8 个版本"这句话没有主语。
 //
 // ⚠️ 与 CellState 分工：Verdict 描述**一行**，CellState 描述**一格**。
@@ -110,7 +187,8 @@ const (
 	//    （这条被真实数据推翻过一次：优先级写反时，一列采集失败
 	//    就让每一行都成了"无法判定"，而好几行明明比得出差异。）
 	VerdictUnknown Verdict = "unknown"
-	// VerdictIgnored 整行的格子全被人为忽略。
+	// VerdictIgnored 这一行没有足够的可比数据，且原因是**被排除挡掉的**：
+	// 要么整行全被忽略，要么剩下的可比版本不足两个而其中有列被排除规则排掉。
 	//
 	// ⚠️ 必须和 VerdictUnknown 分开：忽略是"不用管"，无法判定是"要去查"。
 	VerdictIgnored Verdict = "ignored"
@@ -158,7 +236,7 @@ const (
 	SyncAttrSynced SyncAttr = "synced"
 	// SyncAttrFailed 同步任务失败了 —— 原因在我们这边，且有具体报错
 	SyncAttrFailed SyncAttr = "sync_failed"
-	// SyncAttrNotSynced 确实没推过去（该组织的复制记录里找不到这个 tag）
+	// SyncAttrNotSynced 确实没推过去（该平台的复制记录里找不到这个 tag）
 	SyncAttrNotSynced SyncAttr = "not_synced"
 	// SyncAttrUnknown 🔴 **无法归因**，与 NotSynced 严格分开。
 	//
@@ -220,7 +298,7 @@ type Row struct {
 // Plan 对账方案。
 type Plan struct {
 	Columns []Column
-	// Aliases 各组织的服务名别名：orgID → (该组织上的名字 → 标准名)
+	// Aliases 各平台的服务名别名：orgID → (该平台上的名字 → 标准名)
 	Aliases map[int64]map[string]string
 
 	// SyncGaps 某个平台**为什么**没有复制记录：orgID → 给人看的一句话。
@@ -246,10 +324,10 @@ type Plan struct {
 	// 按**服务名**而不是 deployment 名：服务名是各平台唯一对得齐的东西。
 	ServiceInclude []string
 
-	// SyncFacts 各组织的镜像同步记录：orgID → (service_key\x00tag → 结果)。
+	// SyncFacts 各平台的镜像同步记录：orgID → (service_key\x00tag → 结果)。
 	//
 	// 🔴 **key 在不在，本身就是信息**：
-	//   map 里没有这个 orgID = 该组织没绑复制规则 / Harbor 没配 / 还没拉过
+	//   map 里没有这个 orgID = 该平台没绑复制规则 / Harbor 没配 / 还没拉过
 	//                        → 归因为 unknown，而不是「没同步」
 	//   有 orgID 但没有那个 (服务,tag) = 确实没推过去 → not_synced
 	// 把两者混成一个，「忘了绑定」会被显示成「镜像没推过去」，
@@ -334,7 +412,7 @@ func Compare(plan Plan, data map[string][]Snapshot) Result {
 	//
 	//    原来归因用的是**基准列**的 tag，默认基准就是我方。没有基准之后
 	//    只能挂 is_self：只有我方的镜像才是我们推出去的。
-	//    ⚠️ 参与列里没有我方时（就是"别的两家公司之间对比"），
+	//    ⚠️ 参与列里没有我方时（就是"别的两个平台之间对比"），
 	//       归因根本不成立 —— 那时显式说"无法判断"，不能退化成"未同步"。
 	selfCols := map[string]bool{}
 	for _, c := range plan.Columns {
@@ -373,11 +451,47 @@ func Compare(plan Plan, data map[string][]Snapshot) Result {
 					// 数据看着完全正常，只是对应错了列，是最难发现的一类错。
 					//
 					// 每一列都必须产出一个 cell，行与列严格对齐。
-					cell.State = CellMissing
-					cell.Note = "该组织未部署此服务"
+					//
+					// 🔴 说"未部署"之前，先排除「我方主动没采」这种成因。
+					//    被 workload_exclude 排掉的服务根本不进快照，到这里同样是"查不到"，
+					//    但事实完全相反：不是对方没有，是我们自己不看它。
+					//    实测过 22 个 healthy 的服务被这么显示过，而这句话会随
+					//    导出的 Excel 发到对方公司。
+					//
+					// ⚠️ 只在**非对称**配置下才暴露：两列都配了同一条排除规则时，
+					//    该服务名不进任何一列，整行根本不出现，看起来一切正常。
+					switch {
+					case c.ExcludedByRule(key):
+						cell.State = CellIgnored
+						cell.Note = "按本列的采集规则排除，未参与比对"
+					case c.Degraded:
+						// 🔴 降级列**降格**：宁可说"不确定"，也不给一个错误的确定结论。
+						//    这一列读不到 deployments，只能从 Pod 反推 ——
+						//    副本为 0 的服务没有任何 Pod，采不到 ≠ 没部署。
+						// ⚠️ 落 CellNoData 而不是 CellMissing：前者的含义正是"我们没看到"，
+						//    行判定会因此走 unknown（要去查），而不是 missing（已查实）。
+						cell.State = CellNoData
+						// 🔴 不能写"该平台未部署此服务"。
+						//
+						//    对方多半只给 Pod 的读权限（客户普遍不给 Deployment），
+						//    我们看到的是"有没有运行中的 Pod"，不是"有没有部署过"。
+						//    副本缩到 0 的服务在我们眼里和从没存在过一模一样 ——
+						//    把它说成"未部署"就是把"我们看不见"讲成了"事实是否定的"。
+						//
+						// ⚠️ 文案不提"降级采集"这类内部术语：给客户看的表上出现它，
+						//    看的人不知道那是什么，只会当成我们这边出了故障。
+						//    「没有运行中的实例」是**准确**的陈述，而且不用解释。
+						cell.Note = "没有运行中的实例（这一列只看得到运行中的 Pod）"
+						if c.DegradedNote != "" {
+							cell.Note += "（" + c.DegradedNote + "）"
+						}
+					default:
+						cell.State = CellMissing
+						cell.Note = "该平台未部署此服务"
+					}
 				} else {
 					cell.Snap = &s
-					cell.State, cell.Note = classify(&s)
+					cell.State, cell.Note = classify(&s, c.Aggregated)
 				}
 				if cell.Snap != nil && cell.Snap.RunningTag != "" && cell.Snap.RunningTag != cell.Snap.Tag {
 					cell.Deploying = true
@@ -465,9 +579,25 @@ func RowVerdict(cells []Cell) Verdict {
 		// 那等于替一个没查到的列打包票。
 		return VerdictUnknown
 	}
-	if len(tags) == 0 {
-		// 一个可比的版本都没有，且没被忽略、没缺失、没有不可判定的 ——
-		// 理论上到不了这里，兜底成"无法判定"而不是"一致"。
+	// 🔴 「一致」必须有**至少两个**可比版本。一个值跟自己比恒相等，
+	//    拿它说「一致」等于替那些没取到版本的列打包票。
+	//
+	//    ③ 生产真实数据打脸：平台级视图 62 行「一致」里有 21 行，
+	//       我方 那一格根本没版本 —— 被 workload_exclude 排掉了，
+	//       整行只有 A公司 一个值。三分之一的「一致」是凭空捏的。
+	//
+	//    上面 hasDiff 的注释早写明这种情况「无从比较，交给后面几档去定」，
+	//    可兜底只接了 len(tags)==0 —— 而真正常见的是 ==1，漏在中间。
+	if len(tags) < 2 {
+		if ignored > 0 {
+			// 被排除规则/人为忽略挡掉的，归「已忽略」而不是「无法判定」。
+			// ⚠️ 两档必须分开，因为**行动不同**：
+			//    「无法判定」= 采集出了故障，去修采集；
+			//    这里 = 两边的排除规则不对称，去对齐规则。
+			//    混进 unknown 就再也分不出该找谁。
+			return VerdictIgnored
+		}
+		// 只选了一列（比对不像导出那样强制两列）—— 无从比较。
 		return VerdictUnknown
 	}
 	return VerdictSame
@@ -488,10 +618,23 @@ func hasDiff(tags []string) bool {
 }
 
 // classify 一格有快照时，它是什么状态。
-func classify(s *Snapshot) (CellState, string) {
+//
+// aggregated = 这一列是平台级汇总列 —— 只影响冲突那一支的**措辞**，判定完全相同。
+func classify(s *Snapshot, aggregated bool) (CellState, string) {
 	if s.HasConflict {
-		// 🔴 冲突优先于一切：同一个镜像名命中多个 workload 且版本不同，
-		//    通常是 ns 规则误抓。此时任何版本判定都是猜的，必须拒绝。
+		// 🔴 冲突优先于一切：同一个镜像名命中多个来源且版本不同，
+		//    此时任何版本判定都是猜的，必须拒绝。
+		//
+		// ⚠️ 同一个状态，两种成因，说法必须分开：
+		//    项目级 —— 同一项目里多个 workload 版本不一致，多半是 ns 规则误抓，
+		//              下一步是去查采集规则；
+		//    平台级 —— 这个平台的**不同项目**跑着不同版本，配置没问题，
+		//              下一步是去看哪个项目落后了。
+		//    说成"同名冲突：命中多个 workload"会把人引向查 workload 配置，
+		//    而平台级视图下那里根本没有问题。
+		if aggregated {
+			return CellConflict, "该平台内部各项目版本不一致，无法用一个版本代表整个平台 —— 切到项目级看是哪个项目落后了"
+		}
 		return CellConflict, "同名冲突：命中多个 workload 且版本不一致，拒绝判定"
 	}
 	if !s.IsVersioned {
@@ -517,21 +660,30 @@ func attributeRow(plan Plan, row *Row, selfCols map[string]bool) {
 	}
 	for i := range row.Cells {
 		c := &row.Cells[i]
-		if selfCols[c.Column.Key()] || c.State == CellIgnored || c.State == CellNoData {
+		// 🔴 CellMissing 也要跳过：服务在这一列**根本不存在**，
+		//    "这个版本的镜像推没推过去"就是个没有意义的问题 ——
+		//    格子上并排显示「该平台未部署此服务」和「同步状态未知」，
+		//    后者纯属噪音，还会被误读成"推送出了问题"。
+		//
+		// ⚠️ 这个条件原来漏了 missing，而症状被 self 列掩盖了一半：
+		//    我方列因为第一个条件被跳过、不显示徽标，对方列显示 ——
+		//    同一种状态两种渲染，看着像两回事。
+		if selfCols[c.Column.Key()] ||
+			c.State == CellIgnored || c.State == CellNoData || c.State == CellMissing {
 			continue
 		}
 		c.Sync, c.SyncNote = attribute(plan, c.Column.OrgID, row.ServiceKey, selfTag, len(selfCols) > 0)
 	}
 }
 
-// attribute 归因：**我方**那个版本的镜像，推到这个组织了没有。
+// attribute 归因：**我方**那个版本的镜像，推到这个平台了没有。
 //
 // 🔴 判的是**我方的 tag**（我们要交付的那个版本），不是对方当前跑的 tag。
 // 判对方当前 tag 是错的：对方跑着旧版本，那个旧版本当然同步成功过 ——
 // 那样每一行都会显示「已同步」，这个功能就完全失去意义。
 // 要问的是「我方那个版本，推过去了吗」。
 //
-// ⚠️ hasSelf=false 表示这次比对里**根本没有我方**（别的两家公司之间对比）。
+// ⚠️ hasSelf=false 表示这次比对里**根本没有我方**（别的两个平台之间对比）。
 // 那时归因不成立，必须显式说出来 —— 退化成「未同步」的话，
 // 人会跑去查我们的复制规则，而我们压根不是这次比对的一方。
 func attribute(plan Plan, orgID int64, serviceKey, selfTag string, hasSelf bool) (SyncAttr, string) {
@@ -575,6 +727,24 @@ func attribute(plan Plan, orgID int64, serviceKey, selfTag string, hasSelf bool)
 			return SyncAttrUnknown,
 				"复制记录里没有这个服务 —— 它可能不在任何复制规则的范围内，" +
 					"不代表镜像没推过去"
+		}
+		// 🔴 再分一层：这个服务的复制记录里，**有没有版本号**？
+		//
+		//    Harbor 按仓库复制时，task 的 src/dst_resource 是
+		//    `project/repo [3 item(s) in total]` —— **不带具体 tag**。
+		//    实测过 143 条复制记录，tag 100% 为空。
+		//
+		//    这种情况下说「没有当前这个版本」是**编造**：我们根本不知道推的是哪个版本。
+		//    而 SyncAttrUnknown 上面那段注释写得很清楚 ——
+		//    「我们不知道」永远不能显示成「事实是否定的」。这里差点犯的正是那个错。
+		//
+		// ⚠️ 与「服务不在规则范围内」也要分开：那个是"没配"，这个是"配了但记录里没版本"，
+		//    前者去补规则，后者去看 Harbor 的复制粒度，处理路径不同。
+		if !tagsKnown(facts, serviceKey) {
+			return SyncAttrUnknown,
+				"复制记录里有这个服务，但 Harbor 没记下推的是哪个版本" +
+					"（按仓库复制时它只写 `repo [N item(s) in total]`）—— " +
+					"能确认推过，但确认不了当前这个版本"
 		}
 		return SyncAttrNotSynced,
 			"镜像未同步：这个服务推过别的版本，但复制记录里没有当前这个版本 —— 对方拿不到，想发也发不了"
@@ -625,6 +795,7 @@ func includeService(patterns []string, key string) bool {
 	}
 	return false
 }
+
 // matchService 与采集层用同一套通配语义：app-* / *-canary / *mid* / 全等。
 // 两处语义不一致的话，人在两个输入框里写同样的东西会得到不同结果。
 func matchService(pat, s string) bool {
@@ -715,6 +886,20 @@ func (s IgnoreSet) IsEmpty() bool { return len(s.Services) == 0 && len(s.Cells) 
 //
 // 用来区分「这个版本没推」和「这个服务压根不在复制范围内」——
 // 前者是事实（可以去补推），后者是我们不知道（可能它本来就不该被推）。
+// tagsKnown 这个服务的复制记录里，有没有**带版本号**的条目。
+//
+// 🔴 全空意味着 Harbor 只告诉了我们"这个仓库复制过"，没说复制的是哪个 tag。
+// 拿它去判断"当前版本推没推过"是无据的，必须退回「不知道」。
+func tagsKnown(facts map[string]SyncFact, serviceKey string) bool {
+	prefix := serviceKey + "\x00"
+	for k := range facts {
+		if strings.HasPrefix(k, prefix) && strings.TrimSpace(k[len(prefix):]) != "" {
+			return true
+		}
+	}
+	return false
+}
+
 func serviceSeen(facts map[string]SyncFact, serviceKey string) bool {
 	prefix := serviceKey + "\x00"
 	for k := range facts {

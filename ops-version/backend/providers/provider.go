@@ -1,4 +1,4 @@
-// Package providers 把「从某个组织拉服务版本」这件事抽象成一个接口。
+// Package providers 把「从某个平台拉服务版本」这件事抽象成一个接口。
 //
 // 我方走 Kite、客户走 Rancher、拿不到 API 的客户走手工导入 —— 它们是同一个接口的不同实现。
 // 我方**不是特例分支**：如果给我方单独写一条 CMDB 直读的路径，代码里就会多一条
@@ -22,7 +22,7 @@ import (
 // 采集失败的分类。
 //
 // 🔴 这几种**必须分开**，不能统一成一个「失败」，更不能退化成「返回空列表」：
-// 认证失败如果表现为空列表，界面会显示「该组织没有任何服务」，
+// 认证失败如果表现为空列表，界面会显示「该平台没有任何服务」，
 // 而这跟「对方真的下线了所有服务」在表上长得一模一样 —— 看不出区别就等于没告警。
 var (
 	ErrAuth        = errors.New("认证失败")  // 密码错 / token 过期 → last_sync_status=auth_failed
@@ -115,7 +115,7 @@ type ConflictItem struct {
 	Tag       string `json:"tag"`
 }
 
-// Provider 一个组织的数据来源。
+// Provider 一个平台的数据来源。
 type Provider interface {
 	// Type 返回 kite / rancher / argocd / kubeconfig / manual_import
 	Type() string
@@ -142,6 +142,43 @@ type ListResult struct {
 	// Pods 仅当 withRuntime=true 时有值。pod 接口失败时为 nil，
 	// 但**不影响 Services** —— 少了「发布中」判断和明细，版本对账本身仍然成立。
 	Pods []PodInfo
+
+	// Degraded 这一轮走了**降级路径**：读不到 deployments，改从 Pod 反推服务版本。
+	//
+	// 🔴 必须一路传到界面，不能只写在日志里。降级的后果是
+	//    **副本为 0 的服务在 Pod 层没有任何 Pod → 采不到 → 对账时显示
+	//    「该平台未部署此服务」**，而事实是"我们看不见它"。
+	//    副本缩到 0 是常规运维动作，任何环境都可能有。
+	//
+	// ⚠️ 降级本身是有意设计，
+	//    问题从来不是降级，而是降级的后果没告诉看表的人。
+	Degraded bool
+	// DegradedReason 给人看的一句话，直接显示在列头的悬停提示里。
+	DegradedReason string
+
+	// Excluded 被 workload 规则**主动排掉**的服务清单。
+	//
+	// 🔴 为什么要把它记下来，而不是事后拿规则反推：
+	//    规则匹配的是 **workload 名**，而预检和对账认的是 **ServiceKey（镜像名最后一段）**。
+	//    两者在 helm 部署下基本对不上 —— release 名会被拼进 workload 名
+	//    （`opsalert-另一个产品-backend` vs 镜像 `另一个产品-backend`），
+	//    于是「拿规则去比 ServiceKey」得出的结论与实际排掉的服务**没有交集**。
+	//
+	//    只有在过滤发生的那一刻同时记下 workload 名和 ServiceKey，
+	//    下游才拿得到事实而不是猜测。
+	//
+	// ⚠️ 只记名字，不记版本：它们没有参与对账的资格，
+	//    存版本会让人以为这是一份"可用数据"。
+	Excluded []ExcludedService
+}
+
+// ExcludedService 一个被采集规则排掉的服务。
+type ExcludedService struct {
+	// ServiceKey 镜像名最后一段 —— 对账与预检认的就是它
+	ServiceKey string
+	// Workload 规则实际匹配的那个名字。两者常常不同，排查时必须都在
+	Workload  string
+	Namespace string
 }
 
 // NSRules 命名空间匹配规则。

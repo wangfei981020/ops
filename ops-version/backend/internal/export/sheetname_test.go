@@ -21,7 +21,7 @@ func TestUniqueSheetNameDedup(t *testing.T) {
 // 不撞车时不要平白加后缀 —— 名字要保持可读
 func TestUniqueSheetNameKeepsOriginal(t *testing.T) {
 	used := map[string]bool{}
-	if got := uniqueSheetName("A公司-UAT", used); got != "A公司-UAT" {
+	if got := uniqueSheetName("A平台-UAT", used); got != "A平台-UAT" {
 		t.Errorf("没撞车却改了名：%q", got)
 	}
 }

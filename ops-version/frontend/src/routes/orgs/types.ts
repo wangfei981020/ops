@@ -9,7 +9,17 @@ export interface EnvRow {
   compare_enabled: boolean
   /** 所属项目。0/未设 = 归入该平台的默认项目（对比表的一列 = 项目 × 环境） */
   project_id: number
-  /** 空 = 继承组织级。一个公司两套 Rancher（UAT/PROD 各一套）时在这里各填各的 */
+  /**
+   * 这个环境用哪个数据源。0 = 没选，走下一层（环境手填 → 平台手填 → 平台数据源）。
+   *
+   * 🔴 客户 UAT / PROD 常是两套独立的 Rancher —— 两套各建一个数据源、
+   *    各环境各选各的，凭据就只配一处。手填的话同一套凭据有几个环境填几遍，
+   *    改密码漏掉一处的表现是那一列「认证失败」，人会去查账号本身。
+   */
+  datasource_id: number
+  /** 只出不进：由后端 JOIN 数据源得到，用来显示当前选的是哪个 */
+  datasource_name?: string
+  /** 空 = 继承平台级。一个平台两套 Rancher（UAT/PROD 各一套）时在这里各填各的 */
   /**
    * 🔴 环境级连接**整组覆盖**，不逐字段回落：填了 endpoint 就必须连
    * auth_type 和凭据一起填。逐字段回落会造出「A 的地址配 B 的密码」
@@ -52,6 +62,12 @@ export interface Org {
   sync_at: string | null
   sync_error: string
   envs: EnvRow[]
+  /**
+   * 该平台下的项目，随平台一起返回（省一次请求）。
+   * 🔴 环境行要靠它显示项目名 —— 同一平台同一环境的多个项目在界面上
+   *    长得一模一样时，用户看不出它们的采集范围完全不同。
+   */
+  projects?: { id: number; name: string; enabled: boolean }[]
 }
 
 export interface ProbeResult {
@@ -89,6 +105,7 @@ export function emptyEnv(): EnvRow {
     workload_exclude: [],
     compare_enabled: true,
     project_id: 0,
+    datasource_id: 0,
     endpoint: '',
     auth_type: '',
     username: '',

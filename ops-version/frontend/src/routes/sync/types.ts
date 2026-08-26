@@ -24,7 +24,7 @@ export interface Policy {
   policy_id: number
   name: string
   dest_registry: string
-  /** 绑了组织才能做归因：这条规则把镜像推给谁 */
+  /** 绑了平台才能做归因：这条规则把镜像推给谁 */
   org_id: number | null
   org_name: string
   trigger_type: string

@@ -29,7 +29,7 @@ import (
 //   - Rancher 用 `Authorization: Bearer <token>`；Kite 只认 Cookie，传 Bearer 会 401
 //   - Rancher 的密码登录把 token 放**响应体**；Kite 放 Set-Cookie 且响应是 204
 //
-// ⚠️ 一个公司可能有两套 Rancher（UAT 一个、PROD 一个），
+// ⚠️ 一个平台可能有两套 Rancher（UAT 一个、PROD 一个），
 // 所以 endpoint 和凭据是**按环境**配的，不是按组织 —— 见 org_envs 表。
 type Rancher struct {
 	Endpoint string // https://rancher.x-corp.com
@@ -258,6 +258,7 @@ func (r *Rancher) ListServices(ctx context.Context, clusterID string, rules Rule
 		return nil, nsNoMatchErr(clusterID, rules, r.candidateNamespaces(ctx, clusterID))
 	}
 	var rows []rawWorkload
+	var excluded []ExcludedService
 
 	for _, res := range []string{"deployments", "statefulsets"} {
 		var data []byte
@@ -297,6 +298,17 @@ func (r *Rancher) ListServices(ctx context.Context, clusterID string, rules Rule
 			// workload 级过滤：各家部署的服务集合并不相同，
 			// 只按 ns 抄会让对账表多出一堆「对方没有」的噪音行
 			if !rules.Workload.Match(it.Metadata.Name) {
+				// 🔴 记下**被排掉了什么**，而不是让下游拿规则反推。
+				//    规则比的是 workload 名，而预检/对账认的是 ServiceKey ——
+				//    helm 会把 release 名拼进 workload 名，两者对不上。
+				for _, c := range it.Spec.Template.Spec.Containers {
+					if ref := imageref.Parse(c.Image); ref.Name != "" {
+						excluded = append(excluded, ExcludedService{
+							ServiceKey: ref.Name, Workload: it.Metadata.Name,
+							Namespace: it.Metadata.Namespace,
+						})
+					}
+				}
 				continue
 			}
 			for _, c := range it.Spec.Template.Spec.Containers {
@@ -310,7 +322,7 @@ func (r *Rancher) ListServices(ctx context.Context, clusterID string, rules Rule
 		}
 	}
 
-	out := &ListResult{Services: buildSnapshots(rows, nil)}
+	out := &ListResult{Services: buildSnapshots(rows, nil), Excluded: excluded}
 	if withRuntime {
 		out.Pods = r.fillRuntime(ctx, clusterID, rules, out.Services)
 	}
@@ -744,7 +756,13 @@ func (r *Rancher) listFromPods(ctx context.Context, clusterID string, rules Rule
 		return nil, deployErr
 	}
 
-	out := &ListResult{Services: buildSnapshots(rows, rules.Workload.Include), Pods: pods}
+	out := &ListResult{
+		Services: buildSnapshots(rows, rules.Workload.Include), Pods: pods,
+		// 🔴 这个标记要一路传到对账表头。只写日志的话，看表的人无从知道
+		//    这一列的「未部署」其实是「副本 0，我们看不见」。
+		Degraded:       true,
+		DegradedReason: "版本取自 Pod 的 imageID（读不到 deployments）；副本为 0 的服务不会出现在结果里",
+	}
 	logx.Info("rancher", "collected_from_pods", map[string]any{
 		"cluster": clusterID, "services": len(out.Services),
 		"pods_total": len(l.Items), "pods_kept": len(pods),

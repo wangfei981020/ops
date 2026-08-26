@@ -130,8 +130,24 @@ if [[ -n "$(git -C "$ROOT" status --porcelain 2>/dev/null)" ]]; then
   GIT_COMMIT="${GIT_COMMIT}-dirty"
 fi
 
-LOCAL_IMAGE="registry.example.com/ops/${PRODUCT}-${COMPONENT}:${VERSION}"
-REMOTE_IMAGE="yourorg/${PRODUCT}-${COMPONENT}:${VERSION}"
+# 🔴 镜像仓库地址**不写死在代码里**。
+#
+#	仓库里留的是占位符（registry.example.com / yourorg）——
+#	谁的机器上就该推到谁的仓库，而那是环境的事，不是代码的事。
+#
+# 用法：在仓库根放一个 .env.local（已 gitignore），写自己的真实值：
+#	OPS_LOCAL_REGISTRY=my-harbor.internal:8070/myproject
+#	OPS_REMOTE_ORG=my-dockerhub-account
+#
+# ⚠️ 不配也能跑，只是推到占位地址会失败 —— 失败得很明显，
+#	比"默认推到某个别人的仓库"安全得多。
+[[ -f "$ROOT/.env.local" ]] && set -a && . "$ROOT/.env.local" && set +a
+
+LOCAL_REGISTRY="${OPS_LOCAL_REGISTRY:-registry.example.com/ops}"
+REMOTE_ORG="${OPS_REMOTE_ORG:-yourorg}"
+
+LOCAL_IMAGE="${LOCAL_REGISTRY}/${PRODUCT}-${COMPONENT}:${VERSION}"
+REMOTE_IMAGE="${REMOTE_ORG}/${PRODUCT}-${COMPONENT}:${VERSION}"
 
 echo "产品      $PRODUCT"
 echo "组件      $COMPONENT"

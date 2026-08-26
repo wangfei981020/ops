@@ -38,6 +38,10 @@ const ALLOW = new Map([
   ['POST /api/portal-auth', '运维平台调进来的免登录入口，不是界面动作'],
   ['POST /api/login', '登录页直接用 fetch，不走统一的 api 客户端'],
   ['POST /api/mcp', 'AI 客户端走 JSON-RPC 调，不是界面动作'],
+  // Harbor 的 webhook 目标地址，由 Harbor 主动 POST 进来，前端不该也不能调它
+  // （它带的是 Harbor 的 Auth Header，不是用户会话）。
+  // 配置入口是有的 —— 生成/吊销令牌在「镜像同步 → 设置 → Harbor Webhook 接入」。
+  ['POST /api/webhooks/harbor', 'Harbor 主动推送的入站端点，认证走独立令牌而非用户会话'],
   ['POST /api/oidc/token', 'OIDC 协议端点，由 RP 按协议调用'],
   // ⚠️ 这条的名字骗人：RevertAll **不回滚任何东西**，它返回一串候选 change_id
   // 外加一句「请逐条确认后回滚——批量回滚会跳过冲突检测，风险太高」。

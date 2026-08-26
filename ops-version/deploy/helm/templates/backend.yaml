@@ -63,6 +63,17 @@ spec:
           env:
             {{- toYaml . | nindent 12 }}
           {{- end }}
+          # 🔴 preStop 排空：kubelet 先跑它、跑完才发 SIGTERM，
+          #    这几秒里 Pod 仍正常服务，正好盖住 Endpoints 摘除传播的时间。
+          #    没有它的时候，发布期访问会 504 —— 前端 nginx 还在往一个
+          #    已经开始关闭的 backend 发请求，而生产是单副本，没有第二个 Pod 兜底。
+          # ⚠️ 与代码里的 drainWait 是**两道**保险，不是重复：
+          #    preStop 在 SIGTERM 前、drainWait 在 SIGTERM 后，
+          #    而 preStop 在某些路径（如强制删除）下会被跳过。
+          lifecycle:
+            preStop:
+              exec:
+                command: ["/bin/sh", "-c", "sleep 5"]
           startupProbe:
             httpGet: { path: /health, port: metrics }
             periodSeconds: 3

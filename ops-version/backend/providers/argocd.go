@@ -13,6 +13,7 @@ import (
 	"sync"
 	"time"
 
+	"ops-version-backend/internal/imageref"
 	"ops-version-backend/logx"
 )
 
@@ -261,8 +262,8 @@ func (a *ArgoCD) ListServices(ctx context.Context, clusterRef string, rules Rule
 	logx.Debug("argocd", "apps_picked", map[string]any{
 		"cluster": clusterRef, "total": len(list.Items), "picked": len(picked)})
 
-	rows := a.collectWorkloads(ctx, picked, rules)
-	return &ListResult{Services: buildSnapshots(rows, rules.Workload.Include)}, nil
+	rows, excluded := a.collectWorkloads(ctx, picked, rules)
+	return &ListResult{Services: buildSnapshots(rows, rules.Workload.Include), Excluded: excluded}, nil
 }
 
 // matchesDestination 判断应用是否落在目标集群上。
@@ -282,12 +283,13 @@ func matchesDestination(clusterRef string, app argoApp) bool {
 //
 // ⚠️ 并发要限流：ArgoCD 的 managed-resources 会去 apiserver 取实时状态，
 // 几百个应用同时打会把对方的 ArgoCD 拖慢 —— 我们是来读数据的，不该影响人家发布。
-func (a *ArgoCD) collectWorkloads(ctx context.Context, apps []argoApp, rules Rules) []rawWorkload {
+func (a *ArgoCD) collectWorkloads(ctx context.Context, apps []argoApp, rules Rules) ([]rawWorkload, []ExcludedService) {
 	const concurrency = 6
 	sem := make(chan struct{}, concurrency)
 	var mu sync.Mutex
 	var wg sync.WaitGroup
 	var rows []rawWorkload
+	var excluded []ExcludedService
 
 	for _, app := range apps {
 		wg.Add(1)
@@ -296,7 +298,7 @@ func (a *ArgoCD) collectWorkloads(ctx context.Context, apps []argoApp, rules Rul
 			sem <- struct{}{}
 			defer func() { <-sem }()
 
-			got, err := a.appWorkloads(ctx, app, rules)
+			got, gotExcluded, err := a.appWorkloads(ctx, app, rules)
 			if err != nil {
 				// 单个应用失败不中断整体 —— 但要留 WARN，
 				// 否则"少了几个服务"会被当成"对方下线了"
@@ -307,11 +309,12 @@ func (a *ArgoCD) collectWorkloads(ctx context.Context, apps []argoApp, rules Rul
 			}
 			mu.Lock()
 			rows = append(rows, got...)
+			excluded = append(excluded, gotExcluded...)
 			mu.Unlock()
 		}(app)
 	}
 	wg.Wait()
-	return rows
+	return rows, excluded
 }
 
 // managedResource managed-resources 的一条。
@@ -325,20 +328,21 @@ type managedResource struct {
 	TargetState string `json:"targetState"`
 }
 
-func (a *ArgoCD) appWorkloads(ctx context.Context, app argoApp, rules Rules) ([]rawWorkload, error) {
+func (a *ArgoCD) appWorkloads(ctx context.Context, app argoApp, rules Rules) ([]rawWorkload, []ExcludedService, error) {
 	data, err := a.do(ctx,
 		"/api/v1/applications/"+url.PathEscape(app.Metadata.Name)+"/managed-resources")
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	var mr struct {
 		Items []managedResource `json:"items"`
 	}
 	if err := json.Unmarshal(data, &mr); err != nil {
-		return nil, fmt.Errorf("解析 managed-resources 失败: %w", err)
+		return nil, nil, fmt.Errorf("解析 managed-resources 失败: %w", err)
 	}
 
 	var rows []rawWorkload
+	var excluded []ExcludedService
 	for _, it := range mr.Items {
 		kind := strings.ToLower(it.Kind)
 		if kind != "deployment" && kind != "statefulset" && kind != "daemonset" {
@@ -352,6 +356,14 @@ func (a *ArgoCD) appWorkloads(ctx context.Context, app argoApp, rules Rules) ([]
 			continue
 		}
 		if !rules.Workload.Match(it.Name) {
+			// 记下被排掉的服务名
+			for _, img := range containerImages(it.LiveState) {
+				if ref := imageref.Parse(img); ref.Name != "" {
+					excluded = append(excluded, ExcludedService{
+						ServiceKey: ref.Name, Workload: it.Name, Namespace: ns,
+					})
+				}
+			}
 			continue
 		}
 		// 🔴 只看 liveState：集群里实际的对象。
@@ -363,7 +375,7 @@ func (a *ArgoCD) appWorkloads(ctx context.Context, app argoApp, rules Rules) ([]
 			})
 		}
 	}
-	return rows, nil
+	return rows, excluded, nil
 }
 
 // containerImages 从一个 k8s 对象的 JSON 里取出所有容器镜像。

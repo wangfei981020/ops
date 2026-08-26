@@ -19,8 +19,8 @@ func col(id int64, name, env, status string) compare.Column {
 
 func sampleInput() Input {
 	base := col(1, "我方", "UAT", "success")
-	other := col(2, "A公司", "PROD", "success")
-	dead := col(3, "B公司", "PROD", "auth_failed")
+	other := col(2, "A平台", "PROD", "success")
+	dead := col(3, "B平台", "PROD", "auth_failed")
 	plan := compare.Plan{Columns: []compare.Column{base, other, dead}}
 
 	b := 114
@@ -78,7 +78,7 @@ func TestReadmeIsFirstSheet(t *testing.T) {
 }
 
 // 🔴 采集失败的列，明细页不能是一张空表 ——
-// 空表和「这个组织一个 Pod 都没有」长得一模一样。
+// 空表和「这个平台一个 Pod 都没有」长得一模一样。
 func TestFailedColumnSaysWhy(t *testing.T) {
 	in := sampleInput()
 	blob, err := Build(in)
@@ -86,7 +86,7 @@ func TestFailedColumnSaysWhy(t *testing.T) {
 		t.Fatal(err)
 	}
 	f := open(t, blob)
-	v, err := f.GetCellValue("B公司-PROD", "A2")
+	v, err := f.GetCellValue("B平台-PROD", "A2")
 	if err != nil {
 		t.Fatalf("找不到失败列的明细页: %v", err)
 	}
@@ -104,7 +104,7 @@ func TestReadmeListsPerColumnFreshness(t *testing.T) {
 	for _, r := range rows {
 		joined += strings.Join(r, " | ") + "\n"
 	}
-	for _, want := range []string{"我方/UAT", "A公司/PROD", "B公司/PROD", "采集失败", "比对 key"} {
+	for _, want := range []string{"我方/UAT", "A平台/PROD", "B平台/PROD", "采集失败", "比对 key"} {
 		if !strings.Contains(joined, want) {
 			t.Errorf("说明页缺少 %q", want)
 		}
@@ -113,7 +113,7 @@ func TestReadmeListsPerColumnFreshness(t *testing.T) {
 
 // 🔴 矩阵页**不能再出现任何相对基准的词**。
 //
-// 这张表可能是别的两家公司之间的对账，我方根本不在里面 ——
+// 这张表可能是别的两个平台之间的对账，我方根本不在里面 ——
 // 那时「落后 8」「基准没有」这种话没有主语，收到表的人看不懂。
 func TestMatrixHasNoBaselineWording(t *testing.T) {
 	blob, _ := Build(sampleInput())
@@ -133,7 +133,7 @@ func TestMatrixHasNoBaselineWording(t *testing.T) {
 	}
 }
 
-// sampleInput 里 B公司 那一列采集失败（auth_failed），
+// sampleInput 里 B平台 那一列采集失败（auth_failed），
 // 而 wallet 在另外两列之间是 t-114 vs t-110 —— 确凿的不一致。
 //
 // 🔴 一个采不到的列**不许污染整张表**。
@@ -165,7 +165,7 @@ func TestDeadColumnDoesNotMaskRealDiff(t *testing.T) {
 }
 
 // sheet 名有硬限制：>31 字符或含 : \ / ? * [ ] 会让 NewSheet 失败，
-// 那时**整个导出都出不来** —— 而组织名是用户自己填的，什么都可能有
+// 那时**整个导出都出不来** —— 而平台名是用户自己填的，什么都可能有
 func TestSheetNameSanitized(t *testing.T) {
 	long := strings.Repeat("组织", 20) + "/PROD"
 	got := sheetName(long + ":x[1]")

@@ -21,7 +21,7 @@ import (
 
 // MCP over HTTP（JSON-RPC 2.0）。
 //
-// 目标场景：让 AI 能独立回答「B公司 prod 哪些服务落后了，分别是什么原因」，
+// 目标场景：让 AI 能独立回答「B平台 prod 哪些服务落后了，分别是什么原因」，
 // 而不是把一堆原始数据丢给它自己拼。所以工具的返回值是**判定过的结论**，
 // 不是原始快照 —— 判定逻辑留在服务端，AI 拿到的和人在界面上看到的是同一份事实。
 //
@@ -136,20 +136,25 @@ func mcpTools(role string) []map[string]any {
 		def  map[string]any
 	}{
 		{auth.PermView, map[string]any{
-			"name":        "list_orgs",
-			"description": "列出所有部署组织（我方 + 各客户公司），含各自的数据源类型、环境、最近一次采集的状态与时间。排查「为什么某列没数据」先看这个。",
+			"name": "list_orgs",
+			"description": "列出所有部署平台（我方 + 各客户平台），含各自的数据源类型、环境、最近一次采集的状态与时间。排查「为什么某列没数据」先看这个。" +
+				// ⚠️ 结构说明必须写清楚：envs 曾经是 ["UAT","UAT","UAT"]（每个项目摊一行），
+				//    AI 会读成"有 3 个 UAT 环境"。现在按环境去重并把项目列出来。
+				"envs 的结构是 [{env, projects:[项目名…]}]：一个环境下可能有多个项目，" +
+				"而**对账的一列 = 项目 × 环境**（列名形如 平台·项目/环境）。" +
+				"其他工具的 env 参数只认环境名（如 UAT），项目要用 project 参数单独指定。",
 			"inputSchema": map[string]any{"type": "object", "properties": map[string]any{}},
 		}},
 		{auth.PermView, map[string]any{
 			"name": "list_versions",
-			"description": "列出某个组织某个环境下所有服务当前跑的版本。" +
-				"不指定 project 时返回该组织该环境下**所有项目**的服务（跨项目全量）。",
+			"description": "列出某个平台某个环境下所有服务当前跑的版本。" +
+				"不指定 project 时返回该平台该环境下**所有项目**的服务（跨项目全量）。",
 			"inputSchema": map[string]any{
 				"type": "object",
 				"properties": map[string]any{
-					"org":     map[string]any{"type": "string", "description": "组织名，如 我方 / A公司"},
+					"org":     map[string]any{"type": "string", "description": "平台名，如 我方 / A平台"},
 					"env":     map[string]any{"type": "string", "description": "环境，如 UAT / PROD"},
-					"project": map[string]any{"type": "string", "description": "项目名。留空 = 该组织下所有项目"},
+					"project": map[string]any{"type": "string", "description": "项目名。留空 = 该平台下所有项目"},
 				},
 				"required": []string{"org", "env"},
 			},
@@ -158,7 +163,7 @@ func mcpTools(role string) []map[string]any {
 			"name": "compare_versions",
 			"description": "比对：给一组列（平台+环境的自由组合），返回每个服务的判定结果。" +
 				"**没有基准列** —— 判定是横着比这几列彼此一不一样，不带方向，" +
-				"说不了「谁落后谁」（跨公司是两个 Harbor、两条流水线，版本号本来就不可比）。" +
+				"说不了「谁落后谁」（跨平台是两个 Harbor、两条流水线，版本号本来就不可比）。" +
 				"行结论五态：same/diff/missing/unknown/ignored，含义见返回体里的 verdict_scale。" +
 				"每一格另有 state（version/missing/no_data/unversioned/conflict/ignored）说明这一格为什么能比或不能比。" +
 				"默认只返回**有差异的**服务（only_diff=true）；summary 里给的是全量计数（按行），据此可知总共多少服务。" +
@@ -170,7 +175,7 @@ func mcpTools(role string) []map[string]any {
 				"properties": map[string]any{
 					"columns": map[string]any{
 						"type":        "array",
-						"description": `参与对比的列，如 [{"org":"我方","env":"UAT"},{"org":"A公司","env":"PROD"}]`,
+						"description": `参与对比的列，如 [{"org":"我方","env":"UAT"},{"org":"A平台","env":"PROD"}]`,
 						"items": map[string]any{"type": "object", "properties": map[string]any{
 							"org": map[string]any{"type": "string"},
 							"env": map[string]any{"type": "string"},
@@ -187,7 +192,7 @@ func mcpTools(role string) []map[string]any {
 		}},
 		{auth.PermView, map[string]any{
 			"name":        "get_service_version",
-			"description": "查单个服务在所有组织所有环境上的版本横切，用于回答「这个服务各家分别是什么版本」。",
+			"description": "查单个服务在所有平台所有环境上的版本横切，用于回答「这个服务各家分别是什么版本」。",
 			"inputSchema": map[string]any{
 				"type": "object",
 				"properties": map[string]any{
@@ -242,9 +247,30 @@ func (s *Server) callTool(ctx context.Context, scope auth.Scope, name string, ra
 			if !scope.CanSee(in.ID) {
 				continue
 			}
-			envs := []string{}
+			// 🔴 环境行的粒度是「项目 × 环境」，直接摊平会输出 ["UAT","UAT","UAT"] ——
+			//    AI 会读成"这个平台有 3 个 UAT 环境"，而 list_versions /
+			//    compare_versions 的 env 参数只认环境名，重复值对调用方毫无用处。
+			// ⚠️ 既然项目是真实维度，就把它结构化地说出来，
+			//    口径与 get_service_version 的列名（A公司·项目B/UAT）保持一致。
+			projName := map[int64]string{}
+			if ps, e := s.St.ListProjects(ctx, in.ID); e == nil {
+				for _, pr := range ps {
+					projName[pr.ID] = pr.Name
+				}
+			}
+			seen := map[string]int{} // env → envs 里的下标
+			envs := []map[string]any{}
 			for _, e := range in.Envs {
-				envs = append(envs, e.Env)
+				idx, ok := seen[e.Env]
+				if !ok {
+					seen[e.Env] = len(envs)
+					envs = append(envs, map[string]any{"env": e.Env, "projects": []string{}})
+					idx = len(envs) - 1
+				}
+				if n := projName[e.ProjectID]; n != "" {
+					ps, _ := envs[idx]["projects"].([]string)
+					envs[idx]["projects"] = append(ps, n)
+				}
 			}
 			row := map[string]any{
 				"name": in.Name, "provider": in.ProviderType,
@@ -268,7 +294,7 @@ func (s *Server) callTool(ctx context.Context, scope auth.Scope, name string, ra
 		}
 		in, okk := byName[p.Org]
 		if !okk {
-			return nil, fmt.Errorf("找不到组织 %q（可能不存在，或该令牌的数据范围看不到它）", p.Org)
+			return nil, fmt.Errorf("找不到平台 %q（可能不存在，或该令牌的数据范围看不到它）", p.Org)
 		}
 		col := columnOf(in, p.Env)
 		// 🔴 项目名写错时**报错**，不能静默当成「不筛」——
@@ -281,7 +307,7 @@ func (s *Server) callTool(ctx context.Context, scope auth.Scope, name string, ra
 			return map[string]any{
 				"org": in.Name, "env": p.Env,
 				"available": false,
-				"reason":    fmt.Sprintf("该组织最近一次采集状态为 %s：%s", in.LastSyncStatus, in.LastSyncError),
+				"reason":    fmt.Sprintf("该平台最近一次采集状态为 %s：%s", in.LastSyncStatus, in.LastSyncError),
 				"note":      "这表示我们没能读到数据，不代表对方没有部署服务。请不要据此判断服务缺失。",
 			}, nil
 		}
@@ -317,7 +343,7 @@ func (s *Server) callTool(ctx context.Context, scope auth.Scope, name string, ra
 		for _, c := range p.Columns {
 			in, okk := byName[c.Org]
 			if !okk {
-				return nil, fmt.Errorf("找不到组织 %q", c.Org)
+				return nil, fmt.Errorf("找不到平台 %q", c.Org)
 			}
 			col := columnOf(in, c.Env)
 			if err := applyProjectFilter(ctx, s.St, &col, c.Project); err != nil {
@@ -357,10 +383,10 @@ func (s *Server) callTool(ctx context.Context, scope auth.Scope, name string, ra
 			//
 			//    判定是**无基准**的：只说"这几列彼此一不一样"，说不了"谁落后谁"。
 			//    不写清楚的话，AI 会按常识把 diff 解释成"落后"并给出方向，
-			//    而这张表可能是别的两家公司之间的对账，我方根本不在里面。
+			//    而这张表可能是别的两个平台之间的对账，我方根本不在里面。
 			"verdict_scale": map[string]string{
 				"same":    "这几列的 tag 完全相同",
-				"diff":    "这几列都有，但 tag 不全相同。⚠️ 不含方向 —— 跨公司是两个 Harbor、两条流水线，版本号不可比，说不了谁新谁旧",
+				"diff":    "这几列都有，但 tag 不全相同。⚠️ 不含方向 —— 跨平台是两个 Harbor、两条流水线，版本号不可比，说不了谁新谁旧",
 				"missing": "至少有一列确实没有这个服务",
 				"unknown": "至少有一列没法比：整列采集失败 / 非版本化 tag / 同名冲突",
 				"ignored": "整行被人为忽略，主动不比",
@@ -412,15 +438,27 @@ func (s *Server) callTool(ctx context.Context, scope auth.Scope, name string, ra
 				continue
 			}
 			projName := map[int64]string{}
+			// 🔴 连**服务过滤规则**一起取，不能只取名字。
+			//    只设 ProjectID/ProjectName 而不设 Filter 时，零值 ProjectFilter 的
+			//    Empty() 为真、Matches() 恒返回 true —— 项目的 service_include
+			//    形同虚设，于是 A公司·项目B（只收 biz-*）会返回 central-frontend
+			//    这种根本不属于它的服务。
+			// ⚠️ 与 buildPlan 里那段是同一份规则，两处必须一致；
+			//    只在一处生效的话，界面和 MCP 会对同一个问题给出不同答案。
+			projFilter := map[int64]compare.ProjectFilter{}
 			if ps, e := s.St.ListProjects(ctx, in.ID); e == nil {
 				for _, pr := range ps {
 					projName[pr.ID] = pr.Name
+					projFilter[pr.ID] = compare.ProjectFilter{
+						Include: pr.ServiceInclude, Pins: pr.ServicePins,
+					}
 				}
 			}
 			for _, e := range in.Envs {
 				col := columnOf(in, e.Env)
 				col.ProjectID = e.ProjectID
 				col.ProjectName = projName[e.ProjectID]
+				col.Filter = projFilter[e.ProjectID]
 				cols = append(cols, col)
 			}
 		}
@@ -465,7 +503,7 @@ func (s *Server) callTool(ctx context.Context, scope auth.Scope, name string, ra
 		if p.Org != "" {
 			in, okk := byName[p.Org]
 			if !okk {
-				return nil, fmt.Errorf("找不到组织 %q", p.Org)
+				return nil, fmt.Errorf("找不到平台 %q", p.Org)
 			}
 			iid = in.ID
 		}

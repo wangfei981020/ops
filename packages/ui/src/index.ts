@@ -2,6 +2,7 @@ export { cn } from './lib/cn.js'
 
 export { Button, type ButtonProps, type ButtonVariant, type ButtonSize } from './primitives/Button.js'
 export { Badge, type BadgeProps, type BadgeTone } from './primitives/Badge.js'
+export { EnumBadge, type EnumBadgeProps, type EnumCase } from './primitives/EnumBadge.js'
 export { Popover, MenuItem, MenuSeparator, type PopoverProps } from './primitives/Popover.js'
 export { Dialog, type DialogProps } from './primitives/Dialog.js'
 export {

@@ -158,6 +158,9 @@ export function DataTable<T>({
     measureElement: (el) => el.getBoundingClientRect().height,
   })
 
+  // 有没有分组表头（多层）。第一层要固定高度，下一层的 sticky top 才算得准。
+  const multiHeader = table.getHeaderGroups().length > 1
+
   const virtualRows = virtualize ? virtualizer.getVirtualItems() : null
   const totalSize = virtualize ? virtualizer.getTotalSize() : 0
   const paddingTop = virtualRows?.[0]?.start ?? 0
@@ -193,8 +196,17 @@ export function DataTable<T>({
         {row.getVisibleCells().map((cell, i) => (
           <td
             key={cell.id}
+            data-group-start={
+              !!cell.column.parent && cell.column.parent.columns[0]?.id === cell.column.id
+                ? ''
+                : undefined
+            }
             className={cn(
               'whitespace-nowrap px-[var(--ops-cell-px)] text-foreground',
+              // 与表头那条分组竖线对齐，让一个平台的几列连成一块
+              !!cell.column.parent &&
+                cell.column.parent.columns[0]?.id === cell.column.id &&
+                'border-l border-border',
               selected && i === 0 && 'shadow-[inset_2px_0_0_var(--ops-accent-500)]',
               // ⚠️ 背景必须跟着行态走（选中/hover/普通），不能固定一个色：
               // 固定色会让被钉住的那一格在选中行里显得"没被选中"，
@@ -206,7 +218,13 @@ export function DataTable<T>({
                   selected ? 'bg-brand-bg' : 'bg-card group-hover/row:bg-secondary',
                 ),
             )}
-            style={{ height: 'var(--ops-row-h)' }}
+            // 🔴 width 只认**显式**写了 size 的列。TanStack 的 defaultColumn 会给
+            //    每列塞一个 size=150，无条件取用会把所有表的所有列都压成 150px。
+            //    columnDef.size 在没写时是 undefined，正好用来区分"设过"和"没设过"。
+            style={{
+              height: 'var(--ops-row-h)',
+              ...(cell.column.columnDef.size ? { width: cell.column.columnDef.size } : {}),
+            }}
           >
             {flexRender(cell.column.columnDef.cell, cell.getContext())}
           </td>
@@ -228,24 +246,56 @@ export function DataTable<T>({
     >
       <table className="w-full border-collapse text-sm" style={{ minWidth }}>
         <thead>
-          {table.getHeaderGroups().map((hg) => (
+          {/* 有没有分组表头。决定第一层要不要固定高度（下一层的 top 值靠它算准） */}
+          {table.getHeaderGroups().map((hg, gi) => (
             <tr key={hg.id}>
               {hg.headers.map((header, i) => {
                 const sortable = header.column.getCanSort()
                 const dir = header.column.getIsSorted()
+                // 这一列是不是某个分组的头一列 —— 用来画分组边界。
+                // 没有分组表头的表里 parent 恒为空，永远 false，行为不变。
+                const groupStart =
+                  !!header.column.parent && header.column.parent.columns[0]?.id === header.column.id
+                // 分组表头本身（带子列、且**不是占位格**的那一格）。
+                // ⚠️ 占位格也有 subHeaders（它指向下一层的自己），只判 subHeaders
+                //    会把「#」「服务」上方的空格子也算成分组头，跟着画竖线 —— 实测如此。
+                const isGroupHeader =
+                  multiHeader && gi === 0 && !header.isPlaceholder && header.subHeaders.length > 0
                 return (
                   <th
                     key={header.id}
+                    // 分组表头（多层）必须给 colSpan，否则每个分组只占一列、
+                    // 后面的列全被挤歪。一层表头时 colSpan 恒为 1，无影响。
+                    colSpan={header.colSpan}
+                    // 与 td 同一套：只认显式写了 size 的列，见下面 td 的说明
+                    style={
+                      header.column.columnDef.size
+                        ? { width: header.column.columnDef.size }
+                        : undefined
+                    }
                     // sticky 表头：滚动时不丢列名。
                     // 长表格里丢了列名，用户只能滚回顶部核对，等于每次都重读一遍表。
                     className={cn(
-                      'sticky top-0 z-10 whitespace-nowrap bg-secondary px-[var(--ops-cell-px)] py-2',
+                      'sticky z-10 whitespace-nowrap bg-secondary px-[var(--ops-cell-px)] py-2',
+                      // 每一层表头各自贴在上一层下面。只有一层时 gi=0 -> top-0，
+                      // 与改造前完全一致；两层时第二行落在 28px 处（h-7）。
+                      // 不写的话两行都 top-0，滚动时上面那行会盖住列名。
+                      gi === 0 ? 'top-0' : 'top-7',
+                      multiHeader && gi === 0 && 'h-7 py-1',
                       // 操作列表头要同时贴顶和贴右，z 比普通表头高一层，
                       // 否则横向滚动时会被后面的表头盖住
                       pinned &&
                         i === hg.headers.length - 1 &&
                         'right-0 z-20 shadow-[inset_1px_0_0_var(--ops-border)]',
-                      'border-b border-border text-left text-[11.5px] font-medium uppercase tracking-wide',
+                      'border-b border-border text-[11.5px] font-medium uppercase tracking-wide',
+                      // 🔴 分组表头**居中**，其余左对齐。
+                      //    左对齐时分组头虽然 colSpan 跨了两列，文字却只压在第一列头上，
+                      //    看着像后面那列没人认领 —— 实测「演示·A公司」只标在 TEST1 上。
+                      // ⚠️ text-left 不能无条件写在这里：它和 text-center 同优先级，
+                      //    谁生效取决于 CSS 里的先后而不是这里的顺序，写了就把居中盖掉。
+                      isGroupHeader ? 'text-center' : 'text-left',
+                      // 分组之间画竖线：平台一多，光靠上面那行标题已经分不清哪几列是一家的
+                      (groupStart || isGroupHeader) && 'border-l border-border-strong',
                       'text-muted-foreground',
                       sortable && 'cursor-pointer select-none hover:text-foreground',
                     )}
@@ -254,9 +304,15 @@ export function DataTable<T>({
                       dir === 'asc' ? 'ascending' : dir === 'desc' ? 'descending' : undefined
                     }
                   >
+                    {/* 🔴 isPlaceholder = 这一格是「上一层已经渲染过的列」在本层的占位。
+                        有分组表头时，没参与分组的列（序号、服务名）会在**每一层**各出现一格，
+                        不判断的话表头两行都画一遍 —— 实测「#」和「服务」重复出现了两次。
+                        占位格必须留着（要占位置），但里面不能再渲染内容。 */}
                     <span className="inline-flex items-center gap-1">
-                      {flexRender(header.column.columnDef.header, header.getContext())}
-                      {sortable ? (
+                      {header.isPlaceholder
+                        ? null
+                        : flexRender(header.column.columnDef.header, header.getContext())}
+                      {sortable && !header.isPlaceholder ? (
                         dir === 'asc' ? (
                           <ChevronUp className="size-3" aria-hidden="true" />
                         ) : dir === 'desc' ? (

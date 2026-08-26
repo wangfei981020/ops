@@ -12,13 +12,13 @@ const (
 	PermExport     Perm = "export"      // 导出 xlsx（会外发，一律记审计）
 	PermRefresh    Perm = "refresh"     // 刷新对账组（对外部系统有负载）
 	PermPlanWrite  Perm = "plan.write"  // 管对比方案 / 服务别名
-	PermOrgWrite   Perm = "org.write"   // 管组织（含写入凭据）
+	PermOrgWrite   Perm = "org.write"   // 管平台（含写入凭据）
 	PermAlertWrite Perm = "alert.write" // 管告警设置 / 通知渠道
 	PermAudit      Perm = "audit.view"  // 看审计日志
 	PermUserAdmin  Perm = "user.admin"  // 用户与角色管理
 
 	// 🔴 PermSyncTrigger 单列一项，**不归进 PermOrgWrite 或「编辑」**。
-	//    它是真的往对方公司的 Harbor 推镜像：改配置错了能改回来，推镜像推不回来。
+	//    它是真的往对方平台的 Harbor 推镜像：改配置错了能改回来，推镜像推不回来。
 	//    权限模型里凡是「不可逆的对外动作」都该单独一项，否则迟早被顺带授出去。
 	PermSyncTrigger Perm = "sync.trigger"
 )
@@ -79,10 +79,10 @@ func PermsOf(role string) []Perm {
 	return r.PermList()
 }
 
-// VisibleOrgs 数据范围：这个用户能看到哪些组织。
+// VisibleOrgs 数据范围：这个用户能看到哪些平台。
 //
-// 与角色是**两个独立维度** —— 一个 viewer 可能只能看 A公司，
-// 一个 admin 也可能被限定只管某几个组织。
+// 与角色是**两个独立维度** —— 一个 viewer 可能只能看 A平台，
+// 一个 admin 也可能被限定只管某几个平台。
 // 返回 nil 表示不限。
 type Scope struct {
 	Role string

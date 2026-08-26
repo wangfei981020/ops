@@ -1,4 +1,5 @@
 import { api } from '../../lib/api.js'
+import { PROJECT_ALL } from './types.js'
 
 /** 一列的数据新鲜度。字段名与后端 store.ColumnFreshness 一一对应 */
 export interface Freshness {
@@ -70,17 +71,45 @@ export async function refreshColumns(
   fresh: Map<string, Freshness>,
   onProgress: (done: number, total: number, current: string) => void,
 ): Promise<RefreshOutcome[]> {
-  // 🔴 先按「平台×环境」去重再采。
+  // 按「平台×**项目**×环境」去重再采 —— 这与 colKeyOf 的粒度一致。
   //
-  //    采集的粒度是平台×环境，**不是列** —— 同一平台同一环境下的两个项目
-  //    共用同一份快照。不去重的话，两个项目就把对方的系统采两遍：
-  //    时间翻倍、对方日志里出现重复请求，而结果一模一样。
-  //    项目越多越明显（5 个项目 = 同一个环境采 5 次）。
+  // ⚠️ 这段注释原来写的是「按平台×环境去重」，与实现不符：colKeyOf 一直带着
+  //    projectId。而实现才是对的 —— 每个项目有各自的采集规则、各自落一份快照，
+  //    真按「平台×环境」去重会让后两个项目的快照永远不更新。
+  //
+  // 🔴 「同一环境被打 N 遍」这个真实问题不在这里解决，
+  //    而在后端：collector 对「集群 + 完整规则」都相同的拉取做同轮复用，
+  //    规则不同的项目仍各拉各的。放在前端去重是解决不了的 ——
+  //    定时采集根本不经过这里。
+  // 🔴 平台级列（projectId = PROJECT_ALL）只是**视图**，底层仍是一个个项目：
+  //    新鲜度按真实 project_id 记、采集也按真实 project_id 做。
+  //
+  //    不展开的话 colKeyOf(org, -1, env) 在 fresh 里永远查不到 →
+  //    isStale(undefined) 恒为 true → 每次比对都触发一次注定失败的采集
+  //    （project=-1 找不到环境）→ 界面报「这些列刷新失败，用的是上次采到的数据」，
+  //    而平台页明明显示「采集正常」。两处自相矛盾，且每次比对都白打对方系统一次。
+  //
+  // ⚠️ 展开只用于**执行**，结果最后要聚合回调用方给的那些列 ——
+  //    否则一个平台级列会产出 N 条同名 outcome（"我方·UAT、我方·UAT"）。
+  const expand = (c: { orgId: number; projectId: number; env: string; orgName: string }) => {
+    if (c.projectId !== PROJECT_ALL) return [c]
+    const rows = [...fresh.values()].filter((f) => f.org_id === c.orgId && f.env === c.env)
+    // 兜底：一条新鲜度记录都没有（从没采过）时原样保留，让它走正常的失败路径
+    const real = rows.filter((f) => f.project_id !== 0)
+    return real.length ? real.map((f) => ({ ...c, projectId: f.project_id })) : [c]
+  }
+
+  // 展开后的子列 key → 它属于调用方的哪一列（用于把结果聚合回去）
+  const ownerOf = new Map<string, string>()
   const uniq = new Map<string, { orgId: number; projectId: number; env: string; orgName: string }>()
   for (const c of cols) {
-    const k = colKeyOf(c.orgId, c.projectId, c.env)
-    if (!uniq.has(k)) {
-      uniq.set(k, { orgId: c.orgId, projectId: c.projectId, env: c.env, orgName: c.orgName })
+    const owner = colKeyOf(c.orgId, c.projectId, c.env)
+    for (const sub of expand(c)) {
+      const k = colKeyOf(sub.orgId, sub.projectId, sub.env)
+      ownerOf.set(k, owner)
+      if (!uniq.has(k)) {
+        uniq.set(k, { orgId: sub.orgId, projectId: sub.projectId, env: sub.env, orgName: sub.orgName })
+      }
     }
   }
   const all = [...uniq.values()]
@@ -124,7 +153,23 @@ export async function refreshColumns(
     }
   })
   await Promise.all(workers)
-  return results
+
+  // 🔴 把展开后的子列结果**聚合回调用方给的那些列**。
+  //    一个平台级列展开成 N 个项目，不聚合的话界面会显示
+  //    「我方·UAT、我方·UAT 刷新失败」这种重复项。
+  // ⚠️ 聚合取最"坏"的结果：任一项目失败 → 整列算失败。
+  //    这一列的判定用到了它下面每一个项目的数据，
+  //    有一个没刷上就不能说"这一列是最新的"。
+  const byOwner = new Map<string, RefreshOutcome>()
+  for (const r of results) {
+    const owner = ownerOf.get(r.key) ?? r.key
+    const prev = byOwner.get(owner)
+    const rank = (s: RefreshOutcome['state']) => (s === 'failed' ? 2 : s === 'ok' ? 1 : 0)
+    if (!prev || rank(r.state) > rank(prev.state)) {
+      byOwner.set(owner, { ...r, key: owner })
+    }
+  }
+  return [...byOwner.values()]
 }
 
 export async function loadFreshness(): Promise<Map<string, Freshness>> {

@@ -32,6 +32,44 @@ const SYNC_TONE: Record<string, BadgeTone> = {
   never: 'mute',
 }
 
+type TFn = (k: string) => string
+
+/**
+ * 凭据摘要 —— 必须反映**实际生效的那一层**。
+ *
+ * 🔴 凭据在这个系统里有三层：平台级 / 环境级 / 数据源级，生效的是后两层。
+ *    只读平台级的话，生产上 A公司 会显示「password · 未配凭据」，
+ *    而同一行的采集状态是「正常」、数据源页显示「api_key · 已配凭据」——
+ *    同一个对象三个页面三种说法，排障时人会去补一个填了也没用的地方。
+ */
+function credSummary(o: Org, t: TFn): string {
+  // 引用了数据源 → 地址和凭据都由数据源提供，平台级那份根本不参与
+  if (o.datasource_id > 0) {
+    const kind = o.ds_provider_type || o.provider_type
+    return `${kind} · ${t('opsversion:org.credFromDs')}「${o.datasource_name}」`
+  }
+  const envs = o.envs ?? []
+  const withCred = envs.filter((e) => e.has_credential)
+  if (withCred.length > 0) {
+    const at = withCred[0]?.auth_type || o.auth_type
+    // 部分环境配了、部分没配 —— 这个差别要说出来，否则"正常"和"失败"混在一起没法解释
+    const label =
+      withCred.length === envs.length
+        ? t('opsversion:org.credEnvLevel')
+        : `${t('opsversion:org.credEnvPartial')}（${withCred.length}/${envs.length}）`
+    return `${at} · ${label}`
+  }
+  return `${o.auth_type} · ${
+    o.has_credential ? t('opsversion:org.credConfigured') : t('opsversion:org.credMissing')
+  }`
+}
+
+/** 环境行上要显示的项目名。查不到（老数据 / 默认项目）返回空串，调用方据此不渲染 */
+function projLabel(o: Org, projectId?: number): string {
+  if (!projectId) return ''
+  return (o.projects ?? []).find((p) => p.id === projectId)?.name ?? ''
+}
+
 export function OrgsPage({ session }: { session: Session }) {
   const { t } = useTranslation()
   const qc = useQueryClient()
@@ -66,11 +104,13 @@ export function OrgsPage({ session }: { session: Session }) {
   const say = showToast
 
   /** 导出单个环境的版本清单 */
-  async function exportInventory(orgId: number, orgName: string, env: string) {
+  // 🔴 projectId 必须传：一列 = 项目 × 环境。不传的话三个项目各一个
+  //    「导出清单」链接，点哪个下下来的都是同一份跨项目全量。
+  async function exportInventory(orgId: number, orgName: string, env: string, projectId: number) {
     try {
       await download('/api/export/inventory', {
         method: 'POST',
-        body: JSON.stringify({ org_id: orgId, env }),
+        body: JSON.stringify({ org_id: orgId, env, project_id: projectId }),
       })
     } catch (e) {
       // ⚠️ 采集失败的环境后端会拒绝导出（导出去是张空表，
@@ -151,10 +191,12 @@ export function OrgsPage({ session }: { session: Session }) {
       cell: ({ row }) => (
         <div>
           <Badge tone="info">{row.original.provider_type}</Badge>
-          <div className="text-[11px] text-muted-foreground">
-            {row.original.auth_type} ·{' '}
-            {row.original.has_credential ? t('opsversion:org.credConfigured') : t('opsversion:org.credMissing')}
-          </div>
+          {/* 🔴 凭据有三层（平台 / 环境 / 数据源），实际生效的是后两层。
+              只读平台级那一层的话，会出现「未配凭据」和「采集正常」并排显示 ——
+              自相矛盾，而且把排障引向错误方向：人会去补平台级凭据，
+              可真正生效的配置在环境级或数据源级，平台级填了也没用。
+              ⚠️ 同理 auth_type：平台级那个 password 也是不生效的陈旧值。 */}
+          <div className="text-[11px] text-muted-foreground">{credSummary(row.original, t)}</div>
         </div>
       ),
     },
@@ -175,10 +217,19 @@ export function OrgsPage({ session }: { session: Session }) {
       accessorFn: (r) => r.envs?.length ?? 0,
       cell: ({ row }) => (
         <div className="text-[11px] text-muted-foreground">
+          {/* 🔴 key 必须带 project_id：一个平台的同一环境现在有多行（每个项目一行），
+              只用 e.env 时三行的 key 全是 "UAT" —— React 会按 key 复用节点，
+              增删项目时渲染出的行可能对不上真实数据。 */}
           {(row.original.envs ?? []).map((e) => (
-            <div key={e.env} className="flex items-center gap-1.5">
+            <div key={`${e.env}/${e.project_id ?? 0}`} className="flex items-center gap-1.5">
               <span>
                 {e.env} <span className="font-mono">{(e.cluster_refs ?? []).join(',')}</span>
+                {/* 🔴 项目名必须显示：三行都写「UAT local」的话，
+                    用户完全看不出它们是三个不同项目（采集范围、排除规则各不相同）——
+                    实测过：同一平台的多行长得一模一样，只有其中一行配了 workload_exclude。 */}
+                {projLabel(row.original, e.project_id) && (
+                  <span className="text-brand"> · {projLabel(row.original, e.project_id)}</span>
+                )}
                 {!e.compare_enabled && ` (${t('opsversion:org.notCompared')})`}
               </span>
               {/* 单个环境的版本清单。
@@ -187,7 +238,9 @@ export function OrgsPage({ session }: { session: Session }) {
               {can(session, 'export') ? (
                 <button
                   type="button"
-                  onClick={() => exportInventory(row.original.id, row.original.name, e.env)}
+                  onClick={() =>
+                    exportInventory(row.original.id, row.original.name, e.env, e.project_id ?? 0)
+                  }
                   className="text-[11px] text-brand hover:underline"
                 >
                   {t('opsversion:org.exportInventory')}

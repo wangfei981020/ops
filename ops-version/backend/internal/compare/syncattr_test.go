@@ -79,7 +79,7 @@ func TestNoSelfServiceNoAttribution(t *testing.T) {
 	}
 }
 
-// 🔴 这次比对里**根本没有我方的列**（别的两家公司之间对比）。
+// 🔴 这次比对里**根本没有我方的列**（别的两个平台之间对比）。
 //
 // 镜像同步是「我方推给对方」，两家外部平台之间推没推过，我们无从知道。
 // ⚠️ 退化成「未同步」的话，人会跑去查我们的复制规则 ——
@@ -91,5 +91,36 @@ func TestNoSelfColumnSaysSo(t *testing.T) {
 	}
 	if !strings.Contains(note, "没有我方") {
 		t.Errorf("没说清「这次比对里没有我方」这个前提：%q", note)
+	}
+}
+
+// TestSyncAttrNoTagInRecord Harbor 按仓库复制时不记 tag —— 这时不能说「没推这个版本」。
+//
+// 🔴 实测过 143 条复制记录 tag 100% 为空（Harbor 的 resource 写的是
+// `repo [3 item(s) in total]`）。旧代码在这种情况下返回 not_synced，
+// 界面上显示「镜像未同步：复制记录里没有当前这个版本」——
+// 而真相是我们根本不知道推的是哪个版本。把「不知道」说成了「事实是否定的」。
+func TestSyncAttrNoTagInRecord(t *testing.T) {
+	plan := Plan{
+		Columns:   []Column{{OrgID: 1, IsSelf: true}, {OrgID: 3}},
+		SyncFacts: map[int64]map[string]SyncFact{
+			// 记录里有这个服务，但 tag 是空的 —— 正是生产的形态
+			3: {"wallet-backend\x00": {Status: "Succeed"}},
+		},
+	}
+	attr, note := attribute(plan, 3, "wallet-backend", "20260824-100", true)
+	if attr != SyncAttrUnknown {
+		t.Fatalf("tag 为空时应判 unknown，实际 %s（%s）", attr, note)
+	}
+	if !strings.Contains(note, "哪个版本") {
+		t.Fatalf("说明里要讲清是拿不到版本号，实际：%s", note)
+	}
+
+	// 反向：记录里有真实 tag 时，仍然要能判出「没推当前版本」
+	plan.SyncFacts[3] = map[string]SyncFact{
+		"wallet-backend\x0020260820-095": {Status: "Succeed"},
+	}
+	if attr, _ := attribute(plan, 3, "wallet-backend", "20260824-100", true); attr != SyncAttrNotSynced {
+		t.Fatalf("记录里有别的版本时应判 not_synced，实际 %s", attr)
 	}
 }

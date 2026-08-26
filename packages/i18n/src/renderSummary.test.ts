@@ -12,6 +12,8 @@ const DICT: Record<string, string> = {
   // ⚠️ 故意保留冒号：真实词条就长这样
   'cron:summary.diskWatchCritical': 'critical (≥{{pct}}%): {{count}} — {{top}}',
   'cron:summary.diskWatchSkipped': '{{count}} clusters skipped ({{clusters}})',
+  'cron:summary.failureItem': '{{target}} ({{reason}})',
+  'cron:failure.listDomainsFailed': 'Listing domains failed: {{err}}',
 }
 const t = (k: string, p?: Record<string, unknown>) => {
   const tpl = DICT[k]
@@ -60,5 +62,36 @@ describe('renderSummary', () => {
     expect(out).not.toContain('uat,dev') // String(array) 的样子
     expect(out).toContain('uat')
     expect(out).toContain('dev')
+  })
+
+  it('嵌套片段：参数里的 {key, params} 递归渲染成当前语言', () => {
+    const segs: SummarySeg[] = [
+      {
+        key: 'cron:summary.failureItem',
+        params: {
+          target: 'godaddy-prod',
+          reason: { key: 'cron:failure.listDomainsFailed', params: { err: 'connection refused' } },
+        },
+      },
+    ]
+    expect(renderSummary(t, segs)).toBe('godaddy-prod (Listing domains failed: connection refused)')
+  })
+
+  it('🔴 内层缺词条也要整句作废 —— 不能把生 key 拼进摘要', () => {
+    const segs: SummarySeg[] = [
+      {
+        key: 'cron:summary.failureItem',
+        params: { target: 'x', reason: { key: 'cron:failure.doesNotExist', params: {} } },
+      },
+    ]
+    expect(renderSummary(t, segs)).toBe('')
+  })
+
+  it('普通对象参数（没有 key 字段）不当成嵌套片段', () => {
+    const segs: SummarySeg[] = [
+      { key: 'cron:summary.diskWatchChecked', params: { count: { some: 'obj' } } },
+    ]
+    // 不崩、也不误判成缺词条；渲染结果不为空即可
+    expect(renderSummary(t, segs)).not.toBe('')
   })
 })

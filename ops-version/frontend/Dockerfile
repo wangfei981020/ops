@@ -25,7 +25,6 @@ COPY pnpm-workspace.yaml pnpm-lock.yaml package.json ./
 COPY packages/design/package.json packages/design/
 COPY packages/i18n/package.json packages/i18n/
 COPY packages/ui/package.json packages/ui/
-COPY packages/api/package.json packages/api/
 COPY ops-version/frontend/package.json ops-version/frontend/
 RUN pnpm install --frozen-lockfile
 

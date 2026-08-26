@@ -12,9 +12,10 @@ import (
 	"ops-version-backend/providers"
 
 	"ops-version-backend/logx"
+	"strings"
 )
 
-// SaveSnapshots 把一次采集的结果全量写入某个 (组织, 环境)，并算出变更历史。
+// SaveSnapshots 把一次采集的结果全量写入某个 (平台, 环境)，并算出变更历史。
 //
 // 🔴 **全量覆盖，不做增量。**
 // 增量同步会漏掉「服务被删除了」—— 而「对方 prod 少了一个服务」正是这张表最该发现的信号之一。
@@ -22,7 +23,7 @@ import (
 //
 // 🔴 **采集失败时绝不能调用本函数。**
 // 失败要走 MarkSyncFailed：保留旧快照 + 把组织标成失败态。
-// 如果失败时用空结果覆盖，界面会显示「该组织没有任何服务」，
+// 如果失败时用空结果覆盖，界面会显示「该平台没有任何服务」，
 // 而这跟「对方真的下线了所有服务」在表上长得一模一样 —— 看不出区别就等于没告警。
 // SaveSnapshots 全量覆盖某一列（平台 × 项目 × 环境）的快照。
 //
@@ -31,7 +32,20 @@ import (
 //	漏一处的表现是跨项目串数据：读旧快照时把隔壁项目的读进来，
 //	于是这个项目的服务被判成"新增"，隔壁项目的被判成"消失"并**删掉**。
 //	两个项目跑同名服务时（这正是引入 project 维度的原因）必然发生。
-func (s *Store) SaveSnapshots(ctx context.Context, orgID, projectID int64, env string, snaps []providers.ServiceSnapshot) error {
+//
+// excludeRules 是本轮采集**生效的服务排除规则**（org_envs.workload_exclude）。
+//
+// 🔴 没有它就分不清「服务真的下线了」和「我们改了规则不再采它」——
+//
+//	两者在快照 diff 上完全一样（这一轮没看到），但含义相反。
+//	实测过：把一条笔误规则改对之后，紧随其后的采集往变更历史灌了
+//	18 条假的「服务下线」，而那些服务此刻仍在对方集群上跑着。
+//	通知渠道一旦配上，这类变更会直接发出「服务下线」告警。
+func (s *Store) SaveSnapshots(
+	ctx context.Context, orgID, projectID int64, env string,
+	snaps []providers.ServiceSnapshot,
+	prevExcluded, currExcluded map[string]string,
+) error {
 	now := time.Now()
 
 	tx, err := s.db.BeginTx(ctx, nil)
@@ -96,6 +110,22 @@ func (s *Store) SaveSnapshots(ctx context.Context, orgID, projectID int64, env s
 		oldTag, existed := old[sp.ServiceKey]
 		switch {
 		case !existed:
+			// 🔴 上一轮它是被规则排掉的（所以不在快照里），这一轮又出现 ——
+			//    那是**规则放开了**，不是服务新上线。记 added 会造出一条
+			//    没有对应 removed 的孤立记录，让「这个服务的历史」读起来像
+			//    "它上线过两次"。
+			//
+			// ⚠️ 这是对称性要求：既然「规则排掉」不记 removed（见下面第 4 步），
+			//    「规则放开」就同样不能记 added。少任何一半都会让 added/removed
+			//    配不上对 —— 生产历史里已经有同一个 tag 被记 3 次 added
+			//    而中间没有任何 removed 的记录。
+			if _, wasExcluded := prevExcluded[sp.ServiceKey]; wasExcluded {
+				logx.Info("snapshot", "skip_added_rule_relaxed", map[string]any{
+					"org": orgID, "project": projectID, "env": env, "service": sp.ServiceKey,
+					"note": "上一轮被采集规则排除，本轮规则放开，不记为服务新增",
+				})
+				break
+			}
 			if err := insertChange(ctx, tx, orgID, projectID, env, sp.ServiceKey, "", sp.Tag, "added", now); err != nil {
 				return err
 			}
@@ -123,6 +153,19 @@ func (s *Store) SaveSnapshots(ctx context.Context, orgID, projectID int64, env s
 			`DELETE FROM service_versions WHERE org_id=? AND project_id=? AND env=? AND service_key=?`,
 			orgID, projectID, env, key); err != nil {
 			return err
+		}
+		// 🔴 命中排除规则 = 我们**主动不采**它了，不是它下线了。
+		//    快照要删（它确实不该再参与对账），但**绝不能记 removed** ——
+		//    那是一条与事实相反的历史，且永久留在变更记录里：
+		//    服务回来时（规则改回去/换一列没配规则）也不会产生对应的 added 来抵消它。
+		// 用**本轮采集记下的事实**判断，而不是拿规则反推 ——
+		// 规则比的是 workload 名、这里的 key 是 ServiceKey，helm 下两者对不上
+		if _, nowExcluded := currExcluded[key]; nowExcluded {
+			logx.Info("snapshot", "skip_removed_by_rule", map[string]any{
+				"org": orgID, "project": projectID, "env": env, "service": key,
+				"note": "按采集规则排除，不记为服务下线",
+			})
+			continue
 		}
 		if err := insertChange(ctx, tx, orgID, projectID, env, key, oldTag, "", "removed", now); err != nil {
 			return err
@@ -175,7 +218,7 @@ func (s *Store) LoadSnapshots(ctx context.Context, cols []compare.Column) (map[s
 		//
 		//    实测过（2026-08-21）：
 		//      list_versions(org=我方, env=UAT)              → count 0
-		//      list_versions(org=我方, env=UAT, project=G32) → count 102
+		//      list_versions(org=我方, env=UAT, project=项目A) → count 102
 		//
 		//    而 MCP 的 project 参数是**可选**的 —— 最自然的那种调用返回空，
 		//    AI 会照着回答「这个平台没部署任何服务」。
@@ -191,6 +234,12 @@ func (s *Store) LoadSnapshots(ctx context.Context, cols []compare.Column) (map[s
 		if c.ProjectID != 0 {
 			q += ` AND project_id=?`
 			args = append(args, c.ProjectID)
+		} else {
+			// 不限项目 = 所有项目的并集。
+			// ⚠️ `project_id > 0` 而不是不加条件：历史上有过一份 project_id=0 的
+			//    「平台级全量快照」，那个功能已经拆掉，但老库里可能还留着行。
+			//    保留这个条件，免得它们混进并集、让同一个服务出现两次。
+			q += ` AND project_id > 0`
 		}
 		rows, err := s.db.QueryContext(ctx, q, args...)
 		if err != nil {
@@ -369,6 +418,11 @@ func (s *Store) ListServiceKeys(ctx context.Context, orgID, projectID int64, env
 	if projectID != 0 {
 		q += ` AND project_id=?`
 		args = append(args, projectID)
+	} else {
+		// 🔴 "不限项目" = 所有**项目**，不含平台级全量快照（project_id=0）。
+		//    不写这个条件的话，平台级那份会跟项目级的混在一起返回 ——
+		//    同一个服务出现两次，而调用方（MCP、预检取样）都当它是一行。
+		q += ` AND project_id > 0`
 	}
 	q += ` ORDER BY service_key`
 	rows, err := s.db.QueryContext(ctx, q, args...)
@@ -385,4 +439,154 @@ func (s *Store) ListServiceKeys(ctx context.Context, orgID, projectID int64, env
 		out = append(out, k)
 	}
 	return out, rows.Err()
+}
+
+// SaveExcluded 全量覆盖某一列「被采集规则排掉的服务」清单。
+//
+// 🔴 与 SaveSnapshots 一样是**先删后插**：这份清单描述的是"本轮规则排掉了谁"，
+// 规则改小之后旧记录必须消失，否则预检和对账会一直以为某个服务还被排着，
+// 而它其实早就回到快照里了 —— 那种错静默且会自我延续。
+func (s *Store) SaveExcluded(ctx context.Context, orgID, projectID int64, env string, list []providers.ExcludedService) error {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	if _, err := tx.ExecContext(ctx,
+		`DELETE FROM excluded_services WHERE org_id=? AND project_id=? AND env=?`,
+		orgID, projectID, env); err != nil {
+		return err
+	}
+	now := time.Now()
+	for _, e := range list {
+		if strings.TrimSpace(e.ServiceKey) == "" {
+			continue
+		}
+		if _, err := tx.ExecContext(ctx, `
+			INSERT INTO excluded_services (org_id, project_id, env, service_key, workload, namespace, observed_at)
+			VALUES (?,?,?,?,?,?,?)
+			ON DUPLICATE KEY UPDATE namespace=VALUES(namespace), observed_at=VALUES(observed_at)`,
+			orgID, projectID, env, e.ServiceKey, e.Workload, e.Namespace, now); err != nil {
+			return fmt.Errorf("写被排除服务 %s: %w", e.ServiceKey, err)
+		}
+	}
+	return tx.Commit()
+}
+
+// ListExcludedKeys 取某一列被规则排掉的 ServiceKey 集合。
+//
+// 用于两处，且**必须是同一份数据**：
+//   - 对账：判 missing 之前先看它是不是"我们主动没采"
+//   - 预检：把它并进样本，否则已生效的规则永远显示"命中 0"
+func (s *Store) ListExcludedKeys(ctx context.Context, orgID, projectID int64, env string) (map[string]string, error) {
+	q := `SELECT service_key, workload FROM excluded_services WHERE org_id=? AND env=?`
+	args := []any{orgID, env}
+	// ProjectID==0 = 不限项目（与 LoadSnapshots / ListServiceKeys 同一套语义）
+	if projectID != 0 {
+		q += ` AND project_id=?`
+		args = append(args, projectID)
+	} else {
+		q += ` AND project_id > 0` // 同上：不含平台级全量快照
+	}
+	rows, err := s.db.QueryContext(ctx, q, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := map[string]string{}
+	for rows.Next() {
+		var k, w string
+		if err := rows.Scan(&k, &w); err != nil {
+			return nil, err
+		}
+		out[k] = w
+	}
+	return out, rows.Err()
+}
+
+// ListServiceWorkloads 取某一列上「服务名 → 它的 workload 名列表」。
+//
+// 🔴 规则预检必须按 **workload 名** 匹配，因为采集器就是按它过滤的。
+// 拿 ServiceKey 去比规则在 helm 环境下会算错：helm 把 release 名拼进 workload 名
+// （`opsalert-另一个产品-backend`），而镜像名是 `另一个产品-backend` ——
+// 规则 `另一个产品-*` 匹配后者却匹配不上前者，于是预检报的命中与实际排除的
+// **没有交集**。
+//
+// ⚠️ 同时并入 excluded_services：被排掉的服务已经不在快照里，
+// 不并进来的话，已生效的规则会显示"命中 0"。
+func (s *Store) ListServiceWorkloads(ctx context.Context, orgID, projectID int64, env string) (map[string][]string, error) {
+	out := map[string][]string{}
+
+	add := func(key, wl string) {
+		key, wl = strings.TrimSpace(key), strings.TrimSpace(wl)
+		if key == "" {
+			return
+		}
+		if wl == "" {
+			// workload 名缺失（老数据）时退回服务名 —— 至少还能按老语义匹配上，
+			// 比整条不参与匹配好：后者会让规则显示"命中 0"
+			wl = key
+		}
+		for _, x := range out[key] {
+			if x == wl {
+				return
+			}
+		}
+		out[key] = append(out[key], wl)
+	}
+
+	q := `SELECT service_key, COALESCE(workloads,'') FROM service_versions WHERE org_id=? AND env=?`
+	args := []any{orgID, env}
+	if projectID != 0 {
+		q += ` AND project_id=?`
+		args = append(args, projectID)
+	} else {
+		q += ` AND project_id > 0` // 同上：不含平台级全量快照
+	}
+	rows, err := s.db.QueryContext(ctx, q, args...)
+	if err != nil {
+		return nil, err
+	}
+	for rows.Next() {
+		var key, wlJSON string
+		if err := rows.Scan(&key, &wlJSON); err != nil {
+			rows.Close()
+			return nil, err
+		}
+		var wls []string
+		if wlJSON != "" {
+			// 🔴 解析失败不能静默吞掉：wls 为空会让这个服务退回"按服务名匹配"，
+			//    而那正是 那个错位的来源 —— 规则会命中一批
+			//    实际不受影响的服务，且没有任何迹象说明判据已经降级了。
+			if err := json.Unmarshal([]byte(wlJSON), &wls); err != nil {
+				logx.Warn("store", "workloads_parse_failed", map[string]any{
+					"org": orgID, "env": env, "service": key, "raw": clipText(wlJSON, 120),
+					"err":  err.Error(),
+					"note": "该服务的规则匹配将退回按服务名进行，helm 环境下可能不准",
+				})
+			}
+		}
+		if len(wls) == 0 {
+			add(key, "")
+			continue
+		}
+		for _, w := range wls {
+			add(key, w)
+		}
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+
+	// 并入已被排掉的（它们不在 service_versions 里）
+	ex, err := s.ListExcludedKeys(ctx, orgID, projectID, env)
+	if err != nil {
+		return nil, err
+	}
+	for k, w := range ex {
+		add(k, w)
+	}
+	return out, nil
 }

@@ -23,6 +23,14 @@ interface RuleItem {
   samples: string[]
   /** 语法问题的人话说明。空 = 语法没问题 */
   invalid: string
+  /**
+   * 这条规则已存在于**已保存的配置**里（可能正在生效）。
+   *
+   * 🔴 生效中的排除规则命中 0 是必然的（被它排掉的服务不在样本里），
+   *    不是错误。少了这个字段就分不清「新规则写错了」和「老规则正在干活」，
+   *    而把后者报成前者会把用户推回错误配置。
+   */
+  active: boolean
 }
 
 interface RulePreview {
@@ -70,7 +78,7 @@ export function OrgForm({ org, onClose, onSaved, onToast }: Props) {
   // ─── 数据源 ───
   //
   // 🔴 引用数据源后，地址和凭据由数据源提供，这个表单里不再填一遍。
-  //    这是「同一个 Rancher 被 N 家公司共用」的正解 ——
+  //    这是「同一个 Rancher 被 N 个平台共用」的正解 ——
   //    改一次密码只改一处，而不是 N 处里漏掉一处。
   const dsQ = useQuery({
     queryKey: ['datasources'],
@@ -240,16 +248,32 @@ export function OrgForm({ org, onClose, onSaved, onToast }: Props) {
   }
 
   const ruleLine = (it: RuleItem) => {
-    // 命中 0 是**最重要的那个信号** —— 它几乎一定意味着规则写错了。
-    // ⚠️ 文案不能断言"这条规则没用"：排除规则一旦生效过，被排掉的服务就不在
-    //    库里了，此时命中 0 是正常的。所以只陈述事实 + 反问，不下结论。
+    // 🔴 命中 0 有两种完全不同的含义，**绝不能用同一种口吻说**：
+    //
+    //    ① 规则是新写的 → 命中 0 多半是写错了（少个连字符就永远不命中）→ 提醒
+    //    ② 规则已经在生效 → 被它排掉的服务**本来就不在样本里**，命中 0 是必然 → 中性陈述
+    //
+    //    上一版对两者都标红并断言「几乎一定是规则写错了」，于是三条完全正确、
+    //    正排除着 22 个 healthy 服务的规则被报成错的。用户照提示改回去 →
+    //    服务重新进快照 → 预检显示「命中 22」→ 看起来"修好了"，
+    //    实际把正确配置改坏了，而且每次都得到"看起来正确"的反馈。
+    //
+    // ⚠️ 这是在用户刚做对的时候告诉他做错了 —— 最坏的一种误导。
     const zero = it.matched === 0
+    const zeroButActive = zero && it.active
     return (
       <div key={it.pattern} className="flex items-baseline gap-2 py-0.5">
         <code className="font-mono text-[11px] text-foreground">{it.pattern}</code>
-        <span className={zero ? 'text-[11px] text-danger' : 'text-[11px] text-muted-foreground'}>
-          {zero ? `⚠️ ${t('opsversion:org.rulesZero')}` : `${it.matched}`}
-        </span>
+        {zeroButActive ? (
+          // 已生效的规则命中 0：中性灰，不加警告图标，明确说明"不代表写错了"
+          <span className="text-[11px] text-muted-foreground">
+            {t('opsversion:org.rulesZeroActive')}
+          </span>
+        ) : zero ? (
+          <span className="text-[11px] text-warning">⚠️ {t('opsversion:org.rulesZero')}</span>
+        ) : (
+          <span className="text-[11px] text-muted-foreground">{it.matched}</span>
+        )}
         {it.invalid && <span className="text-[11px] text-danger">{it.invalid}</span>}
         {!zero && it.samples.length > 0 && (
           <span className="truncate font-mono text-[11px] text-muted-foreground">
@@ -284,8 +308,15 @@ export function OrgForm({ org, onClose, onSaved, onToast }: Props) {
             <div className="mt-1 rounded-md border border-border bg-secondary/40 px-2 py-1">
               {p.include.map(ruleLine)}
               {p.exclude.map(ruleLine)}
+              {/* ⚠️ kept 同样会误导：样本是**已过滤的快照**，
+                  所以「80 / 80」看着像"这些规则什么都没排除"，
+                  而实际上它们正排除着 22 个服务（那 22 个压根不在这 80 里面）。
+                  数字不加解释就是错的暗示。 */}
               <div className="mt-1 text-[11px] text-muted-foreground">
                 {t('opsversion:org.rulesKept')} {p.kept} / {p.total}
+              </div>
+              <div className="text-[11px] text-muted-foreground">
+                {t('opsversion:org.rulesKeptNote')}
               </div>
             </div>
           ))}
@@ -464,7 +495,7 @@ export function OrgForm({ org, onClose, onSaved, onToast }: Props) {
         </label>,
       )}
 
-      {/* 项目：一家公司下的多个项目。对比表的一列 = 项目 × 环境。
+      {/* 项目：一个平台下的多个项目。对比表的一列 = 项目 × 环境。
           ⚠️ 放在环境之前 —— 环境要挂到项目下，先有项目才谈得上归属。 */}
       <div className="mb-2 mt-4 border-b border-border pb-1.5 text-xs font-semibold text-foreground">
         {t('opsversion:proj.section')}
@@ -606,19 +637,47 @@ export function OrgForm({ org, onClose, onSaved, onToast }: Props) {
               ⚠️ 判定走后端接口（复用采集器那一份 MatchPattern），不在前端另写 ——
               前端自己实现一份必然与采集器漂移，那会变成"预检说命中、实际没抄回来"。 */}
         {isEdit && renderRulePreview(i, e)}
-        {/* 🔴 环境级连接覆盖：客户常有两套 Rancher（UAT 一个、PROD 一个）。
-              **整组覆盖不逐字段回落** —— 所以填了地址就必须把认证方式和凭据一起填，
-              只填地址的话凭据是空的，采集必然认证失败，而界面上看地址明明填了。 */}
+        {/* 🔴 优先给「选数据源」。
+              客户 UAT / PROD 各一套 Rancher 是常态，而手填意味着同一套凭据
+              有几个环境就要填几遍 —— 改一次密码要改 N 处，漏掉一处的表现是
+              那一列「认证失败」，人会去查账号本身，查不到是"另一处没改"。
+              数据源这层本来就是为共用凭据而存在的，这里把它接上。 */}
         {field(
-          t('opsversion:org.override'),
-          input(e.endpoint, (v) => setEnv(i, { endpoint: v }), t('opsversion:org.overridePh')),
-          t('opsversion:org.overrideHint'),
+          t('opsversion:org.envDatasource'),
+          <Select
+            label={t('opsversion:org.envDatasource')}
+            value={String(e.datasource_id || 0)}
+            onChange={(v) => {
+              const id = Number(v) || 0
+              // 🔴 选了数据源就把手填的整组清掉。
+              //    两者并存时后端以数据源为准（见 OrgEnv.Conn），
+              //    而界面上还留着旧的地址和账号 —— 人会以为在用那份，
+              //    改了半天没反应。清掉才让"当前用的是哪个"一眼看得出。
+              setEnv(i, id > 0
+                ? { datasource_id: id, endpoint: '', username: '', password: '', api_key: '' }
+                : { datasource_id: 0 })
+            }}
+            options={[
+              { value: '0', label: t('opsversion:org.envDsNone') },
+              ...dsList.map((d) => ({ value: String(d.id), label: `${d.name}（${d.endpoint || d.provider_type}）` })),
+            ]}
+          />,
+          t('opsversion:org.envDsHint'),
         )}
+        {/* 手填仍然留着：老配置在用，而且偶尔有一次性的地址不值得建数据源。
+              ⚠️ 选了数据源时**隐藏**手填 —— 两个入口同时摆着，人会两边都填，
+              然后疑惑到底哪个生效。 */}
+        {!(e.datasource_id > 0) &&
+          field(
+            t('opsversion:org.override'),
+            input(e.endpoint, (v) => setEnv(i, { endpoint: v }), t('opsversion:org.overridePh')),
+            t('opsversion:org.overrideHint'),
+          )}
         {/* 🔴 认证方式与凭据**常显**，不藏在「填了地址才出现」的条件里。
               藏起来的结果是功能等于不存在：用户看不到入口，就以为
               「一个环境一个 Rancher」这种场景不支持 —— 实测被这么反馈过。
               留空继承平台级，填了就必须整组填（见下面的提示）。 */}
-        {
+        {!(e.datasource_id > 0) && (
           <>
             {field(
               t('opsversion:org.authType'),
@@ -666,7 +725,7 @@ export function OrgForm({ org, onClose, onSaved, onToast }: Props) {
                   : t('opsversion:org.envCredInherit'),
             )}
           </>
-        }
+        )}
       </div>
     )
   }

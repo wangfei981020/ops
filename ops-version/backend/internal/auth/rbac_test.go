@@ -47,7 +47,7 @@ func TestNoCredentialReadPermExists(t *testing.T) {
 }
 
 func TestScopeIndependentOfRole(t *testing.T) {
-	// 数据范围与角色是两个维度：admin 也可以被限定只看某些组织
+	// 数据范围与角色是两个维度：admin 也可以被限定只看某些平台
 	s := Scope{Role: RoleAdmin, Orgs: map[int64]bool{1: true}}
 	if !s.CanSee(1) || s.CanSee(2) {
 		t.Error("数据范围应独立于角色生效")

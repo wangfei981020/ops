@@ -20,6 +20,7 @@ import { useState } from 'react'
 import { api, toLoadError } from '../../lib/api.js'
 import { type Session, can } from '../../lib/session.js'
 import type { Org } from '../orgs/types.js'
+import { WebhookSection } from './WebhookSection.js'
 import { HarborForm } from './HarborForm.js'
 import { ImageCheck } from './ImageCheck.js'
 import { NotifySection } from './NotifySection.js'
@@ -468,6 +469,7 @@ export function SyncPage({ session }: { session: Session }) {
         }
       >
         <div className="flex flex-col gap-5">
+          <WebhookSection />
           {/* 🔴 三块有**依赖顺序**：没配 Harbor 就拉不到规则，没绑规则就没有通知判定。
               全空时并列三个大空态，等于让人对着三块「还没有…」猜先做哪个，
               而且每个 EmptyState 都很高，滚很久还是空的。

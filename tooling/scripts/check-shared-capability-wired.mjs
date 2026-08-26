@@ -56,6 +56,15 @@ const CAPABILITIES = [
     providers: ['LocaleToggle'],
     why: '语言包是完整的两份，没有开关等于只做了一半；看不懂的人连登录框都读不了',
   },
+  {
+    name: '滚动更新的资源自愈',
+    providers: ['opsAssetGuard'],
+    // 不在 src 下：这是个 vite 插件，接在构建配置里
+    file: 'frontend/vite.config.ts',
+    why:
+      '新旧 pod 并存的窗口里，index.html 和入口 JS 可能来自不同版本 → 404 → 纯白页面。' +
+      '副本越多越容易撞上（每次刷新约 50%），而这恰恰是"高可用"配置的默认形态',
+  },
 ]
 
 function walk(dir, out = []) {
@@ -91,12 +100,51 @@ if (products.length === 0) {
   process.exit(0)
 }
 
+// 按需读取：大多数能力扫 frontend/src，个别（构建期插件）扫指定文件。
+// 缓存一下，别为每条能力重复读整个 src 树。
+const srcCache = new Map()
+function sourceFor(product, cap) {
+  if (cap.file) {
+    try {
+      return readFileSync(join(ROOT, product, cap.file), 'utf8')
+    } catch {
+      // 文件不存在 = 这个产品没接 = 该报，返回空串让下面的判定落空
+      return ''
+    }
+  }
+  if (!srcCache.has(product)) {
+    srcCache.set(
+      product,
+      walk(join(ROOT, product, 'frontend', 'src'))
+        .map((f) => readFileSync(f, 'utf8'))
+        .join('\n'),
+    )
+  }
+  return srcCache.get(product)
+}
+
+// 🔴 判据必须是「**真的用了**」，不能是「标识符出现过」。
+//
+//	第一版写成 `new RegExp(\`\\b${c}\\b\`).test(src)`，
+//	变异测试直接打不穿：把 `opsAssetGuard()` 那行删掉、只留 import，
+//	守卫照样是绿的 —— 而那正是"引入了但没接上"的典型形态。
+//	（按约定：自己的变异打不穿 = 重写信号，不是加基线信号。）
+//
+//	所以先剥掉注释和 import/export 语句，剩下的才算"使用处"：
+//	  组件 → JSX 里的 <ThemeToggle />
+//	  插件 → plugins 数组里的 opsAssetGuard()
+function usableSource(src) {
+  return src
+    .replace(/\/\*[\s\S]*?\*\//g, '')      // 块注释
+    .replace(/^\s*\/\/.*$/gm, '')           // 行注释
+    .replace(/^\s*import\s[\s\S]*?from\s+['"][^'"]+['"];?\s*$/gm, '')
+    .replace(/^\s*export\s+\{[^}]*\}\s+from\s+['"][^'"]+['"];?\s*$/gm, '')
+}
+
 const gaps = []
 for (const p of products) {
-  const src = walk(join(ROOT, p, 'frontend', 'src'))
-    .map((f) => readFileSync(f, 'utf8'))
-    .join('\n')
   for (const cap of CAPABILITIES) {
+    const src = usableSource(sourceFor(p, cap))
     if (!cap.providers.some((c) => new RegExp(`\\b${c}\\b`).test(src))) {
       gaps.push({ product: p, cap })
     }

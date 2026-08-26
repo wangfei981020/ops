@@ -383,7 +383,27 @@ export function renderSummary(
     // ——那会给出 "a,b,c"，在中文界面上是错的（该是 "a、b、c"）。
     const params: Record<string, unknown> = {}
     for (const [k, v] of Object.entries(s.params ?? {})) {
-      params[k] = Array.isArray(v) ? formatList(t, v.map(String)) : v
+      if (Array.isArray(v)) {
+        params[k] = formatList(t, v.map(String))
+        continue
+      }
+      // 嵌套片段：`{key, params}` 形状的参数递归渲染。
+      //
+      // 为什么需要：任务摘要里要说清「哪个源、为什么失败」，而"为什么"本身
+      // 是一条带自己 key 的可翻译句子（cron:failure.*）。后端原来在服务端
+      // 把它拼成中文串再塞进参数 —— 于是**外层 key 翻译了、参数还是中文**，
+      // 英文界面上会看到 "2/2 data source(s) failed. 本地预演（拉取列表失败：…）"。
+      //
+      // ⚠️ 缺词条的判定要一路向上传播：内层渲染不出来时整句作废，
+      //    否则会把生 key 拼进摘要，比露中文更糟。
+      if (v && typeof v === 'object' && typeof (v as { key?: unknown }).key === 'string') {
+        const inner = v as { key: string; params?: Record<string, unknown> }
+        const innerText = t(inner.key, inner.params ?? {})
+        if (innerText === inner.key) return ''
+        params[k] = innerText
+        continue
+      }
+      params[k] = v
     }
     const text = t(s.key, params)
     // 🔴 词条缺失时 i18next 原样返回 key。把生 key 拼进摘要，

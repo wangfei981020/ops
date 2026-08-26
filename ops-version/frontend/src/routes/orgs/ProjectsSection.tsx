@@ -6,7 +6,7 @@ import { api } from '../../lib/api.js'
 import { fromLines, normLines, toLines } from './types.js'
 
 /**
- * 一家公司下的项目。对比表的一列 = 项目 × 环境。
+ * 一个平台下的项目。对比表的一列 = 项目 × 环境。
  *
  * 🔴 同一个 ns 里区分多项目的三档（按优先级，够用即止）：
  *   ① ns 隔离      → 环境的 ns 规则就够，这里留空
@@ -283,7 +283,7 @@ function ProjectForm({
           <input
             value={f.name}
             onChange={(e) => setF((p) => ({ ...p, name: e.target.value }))}
-            placeholder="G66"
+            placeholder="项目B"
             className="w-full rounded-md border border-input bg-background px-2.5 py-1.5 text-xs text-foreground"
           />
         </div>

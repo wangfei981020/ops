@@ -25,7 +25,17 @@ const walk = (dir) => {
     const p = resolve(dir, e.name)
     if (e.isDirectory()) walk(p)
     else if (/\.tsx?$/.test(e.name)) {
-      for (const m of readFileSync(p, 'utf8').matchAll(/\bt\(\s*'([a-z][\w-]*):([\w.]+)'/g)) {
+      // 🔴 先剥注释再抽 key。
+      //
+      //	组件的文档注释里常写用法示例：
+      //	  *   renewed: { tone: 'ok', label: t('domains:renew.status.renewed') }
+      //	那是**举例**，不是真实引用。不剥的话，共享包里一段示例
+      //	就会让每个产品都被要求提供一个它根本用不到的命名空间 ——
+      //	而这类误报正是让人给守卫加 --skip 的原因。
+      const src = readFileSync(p, 'utf8')
+        .replace(/\/\*[\s\S]*?\*\//g, '')
+        .replace(/^\s*\/\/.*$/gm, '')
+      for (const m of src.matchAll(/\bt\(\s*'([a-z][\w-]*):([\w.]+)'/g)) {
         required.add(`${m[1]}:${m[2]}`)
       }
     }

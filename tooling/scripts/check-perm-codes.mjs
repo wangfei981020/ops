@@ -23,7 +23,9 @@ import { fileURLToPath } from 'node:url'
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), '../..')
 
 const SOURCES = [
-  {
+    {
+    // 🔴 补上：这个产品此前**从没被这道守卫查过** ——
+    //    SOURCES 里没有它，而守卫照样对全仓打印 ✓。
     product: 'ops-version',
     backend: 'ops-version/backend/internal/auth/rbac.go',
     nav: 'ops-version/frontend/src/layouts/nav.ts',
@@ -33,17 +35,21 @@ const SOURCES = [
 let failed = 0
 
 for (const src of SOURCES) {
+  // ⚠️ 产品目录整个不存在 = 这个仓库里没有它（如单产品仓库），**跳过而不是失败**。
+  //    「该有却读不到」和「这个仓库压根没有这个产品」是两回事：
+  //    前者是真问题，后者报错只会让人学会忽略这道守卫。
+  if (!existsSync(join(ROOT, src.product))) continue
   const backendSrc = read(join(ROOT, src.backend))
   const navSrc = read(join(ROOT, src.nav))
   if (backendSrc === null || navSrc === null) continue
 
-  // 后端认识的权限码。
-  //
+  // 后端认识的菜单码：permPrefixRules 和逐路由表里出现的所有 menu:*
   // ⚠️ 两种形态都要认：
-  //   menu:xxx                          —— 菜单前缀式
-  //   PermXxx Perm = "org.write"        —— 扁平式（本产品用这种）
-  // 只认一种的后果实测过：抽到 0 个，而守卫**照样报"共 N 处不一致"**，
-  // 让人以为是权限码写错了，实际是提取正则不认这个产品的写法。
+  //   menu:xxx                    —— 菜单前缀式
+  //   PermXxx Perm = "org.write"  —— 扁平式
+  // 只认一种的后果实测过：在用扁平式的产品上抽到 0 个，
+  // 而守卫**照样报"共 N 处不一致"**，让人以为是权限码写错了，
+  // 实际是提取正则不认这个产品的写法。
   const known = new Set([
     ...(backendSrc.match(/menu:[a-z0-9_]+/g) ?? []),
     ...[...backendSrc.matchAll(/Perm\w+\s+Perm\s*=\s*"([a-z][a-z0-9._]*)"/g)].map((m) => m[1]),
@@ -83,12 +89,13 @@ for (const src of SOURCES) {
     failed++
   }
 
-  // 🔴 这一刀是为了让"防线自己失效"变成显式失败，而不是一句 ✓。
-  //
-  // ⚠️ 但**不能断言"每个菜单项都有 perm"** —— perm 是可选的：
+  // 每个菜单项都有 path，所以 path 的个数就是菜单项数。
+  // 抽到的 perm 少于菜单项数 = 有项没配，或者正则又漏了 ——
+  // 这一刀是为了让"防线自己失效"变成一个显式失败，而不是一句 ✓。
+  // ⚠️ **不能断言"每个菜单项都有 perm"** —— perm 是可选的：
   //    不挂 perm 的菜单对所有登录用户可见，那是合法设计，不是漏配。
-  //    （原来按 ops 系某个产品的写法断言 perm 数 == 菜单项数，
-  //    换个产品就把"公开菜单"报成"漏配权限"。）
+  //    实测撞到过：按某个产品的写法断言 perm 数 == 菜单项数，
+  //    换个产品就把"公开菜单"报成"漏配权限"。
   //
   // 真正要防的是**正则失效**：nav.ts 明明有菜单项，却一个都没抽到。
   // 菜单项的特征是 `key: 'xxx'`（路由在 router 里映射）或 `path: 'xxx'`，两种都认。
@@ -141,6 +148,8 @@ for (const src of SOURCES) {
 {
   const backendCodes = new Set()
   for (const src of SOURCES) {
+    // 同上：这个仓库里没有该产品就跳过，不是失败
+    if (!existsSync(join(ROOT, src.product))) continue
     const go = read(join(ROOT, src.backend))
     if (!go) continue
     for (const m of go.matchAll(/"(cmdb:[a-z_]+)"/g)) backendCodes.add(m[1])

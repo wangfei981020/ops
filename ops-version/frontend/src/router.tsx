@@ -189,7 +189,7 @@ function RootLayout() {
               {t(`opsversion:role.${session.role}`)}
             </Badge>
           </span>
-          {/* 数据范围被限定时要让人知道 —— 否则「怎么少了几个组织」会被当成故障。
+          {/* 数据范围被限定时要让人知道 —— 否则「怎么少了几个平台」会被当成故障。
               这条即使窄屏也保留：它影响的是"看到的数据全不全" */}
           {session.scoped && <Badge tone="warn">{t('opsversion:user.scoped')}</Badge>}
           {/* 主题 / 语言 / 密度。

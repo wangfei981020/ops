@@ -25,8 +25,8 @@ func snap(key, tag string, build int, versioned bool) Snapshot {
 // 要拿我方 UAT 去比对方的 UAT 和 PROD —— 列是自由组合，不是同环境对同环境
 func TestCrossEnvColumns(t *testing.T) {
 	ourUAT := col(1, "我方", "UAT", "success")
-	aUAT := col(2, "A公司", "UAT", "success")
-	aPROD := col(2, "A公司", "PROD", "success")
+	aUAT := col(2, "A平台", "UAT", "success")
+	aPROD := col(2, "A平台", "PROD", "success")
 
 	plan := Plan{Columns: []Column{ourUAT, aUAT, aPROD}}
 	data := map[string][]Snapshot{
@@ -44,7 +44,7 @@ func TestCrossEnvColumns(t *testing.T) {
 			t.Errorf("第 %d 列 state=%s，要 %s", i, cells[i].State, want)
 		}
 	}
-	// ⚠️ 三列里 A公司 PROD 的 tag 不同 → 整行「不一致」。
+	// ⚠️ 三列里 A平台 PROD 的 tag 不同 → 整行「不一致」。
 	//    **不说方向** —— 没有基准，"谁落后谁"这句话没有主语。
 	if res.Rows[0].Verdict != VerdictDiff {
 		t.Errorf("行结论 = %s，三列 tag 不全相同应为 diff", res.Rows[0].Verdict)
@@ -54,8 +54,8 @@ func TestCrossEnvColumns(t *testing.T) {
 // 🔴 采集失败 ≠ 对方没部署。这两个混了，token 过期会显示成"对方把服务全下线了"
 func TestSyncFailureIsNotMissing(t *testing.T) {
 	base := col(1, "我方", "UAT", "success")
-	dead := col(2, "B公司", "PROD", "auth_failed")
-	gone := col(3, "C公司", "PROD", "success") // 采集成功，但真的没这个服务
+	dead := col(2, "B平台", "PROD", "auth_failed")
+	gone := col(3, "C平台", "PROD", "success") // 采集成功，但真的没这个服务
 
 	plan := Plan{Columns: []Column{base, dead, gone}}
 	data := map[string][]Snapshot{
@@ -81,7 +81,7 @@ func TestSyncFailureIsNotMissing(t *testing.T) {
 	// 🔴 采集失败的列**不会**把行判成「不一致」—— 拿不到数据不是差异。
 	//    这一行的结论来自 gone 列（采集成功、确实没有），
 	//    而不是 dead 列（我们没采到）。
-	//    混了的话，一个组织挂掉会让整表看起来"差异激增"，掩盖真正的差异。
+	//    混了的话，一个平台挂掉会让整表看起来"差异激增"，掩盖真正的差异。
 	if got := res.Rows[0].Verdict; got != VerdictMissing {
 		t.Errorf("行结论 = %s，应为 missing（gone 确实没有）—— 采集失败不该变成差异", got)
 	}
@@ -91,7 +91,7 @@ func TestSyncFailureIsNotMissing(t *testing.T) {
 // 🔴 非版本化 tag 两边字符串相同也不能判绿
 func TestNonVersionedTagNeverGreen(t *testing.T) {
 	base := col(1, "我方", "PROD", "success")
-	other := col(2, "A公司", "PROD", "success")
+	other := col(2, "A平台", "PROD", "success")
 	plan := Plan{Columns: []Column{base, other}}
 	data := map[string][]Snapshot{
 		base.Key():  {snap("nginx", "stable", -1, false)},
@@ -111,7 +111,7 @@ func TestNonVersionedTagNeverGreen(t *testing.T) {
 // 冲突优先于一切版本判定
 func TestConflictWins(t *testing.T) {
 	base := col(1, "我方", "PROD", "success")
-	other := col(2, "B公司", "PROD", "success")
+	other := col(2, "B平台", "PROD", "success")
 	plan := Plan{Columns: []Column{base, other}}
 	s := snap("settle", "t-44", 44, true)
 	s.HasConflict = true
@@ -127,7 +127,7 @@ func TestConflictWins(t *testing.T) {
 // 别名映射：对方改了服务名不该冒出成对的假缺失
 func TestAliasAvoidsFakeMissing(t *testing.T) {
 	base := col(1, "我方", "PROD", "success")
-	other := col(2, "A公司", "PROD", "success")
+	other := col(2, "A平台", "PROD", "success")
 	plan := Plan{
 		Columns: []Column{base, other},
 		Aliases: map[int64]map[string]string{2: {"openapi-svc": "openapi-backend"}},
@@ -211,7 +211,7 @@ func snapT(key, tag string, build int) Snapshot {
 // 人会跑去查 Harbor 的复制规则，而真正要做的是在界面上把规则绑到组织。
 func TestUnboundIsNotUnsynced(t *testing.T) {
 	base := col(1, "我方", "UAT", "success")
-	other := col(2, "A公司", "PROD", "success")
+	other := col(2, "A平台", "PROD", "success")
 	plan := Plan{Columns: []Column{base, other}}
 	data := map[string][]Snapshot{
 		base.Key():  {snapT("wallet", "t-114", 114)},
@@ -227,7 +227,7 @@ func TestUnboundIsNotUnsynced(t *testing.T) {
 // 有绑定、有记录、成功 → 差异的原因在对方（没发版）
 func TestSyncedMeansTheirTurn(t *testing.T) {
 	base := col(1, "我方", "UAT", "success")
-	other := col(2, "A公司", "PROD", "success")
+	other := col(2, "A平台", "PROD", "success")
 	plan := Plan{
 		Columns: []Column{base, other},
 		SyncFacts: map[int64]map[string]SyncFact{
@@ -249,10 +249,10 @@ func TestSyncedMeansTheirTurn(t *testing.T) {
 // 有绑定但记录里没有这个 tag → 确实没推过去，是我们的锅
 func TestNotSyncedIsOurFault(t *testing.T) {
 	base := col(1, "我方", "UAT", "success")
-	other := col(2, "A公司", "PROD", "success")
+	other := col(2, "A平台", "PROD", "success")
 	plan := Plan{
 		Columns: []Column{base, other},
-		// 有这个组织的记录，但只同步过旧版本
+		// 有这个平台的记录，但只同步过旧版本
 		SyncFacts: map[int64]map[string]SyncFact{
 			2: {"wallet\x00t-110": {Status: "Succeed"}},
 		},
@@ -273,7 +273,7 @@ func TestNotSyncedIsOurFault(t *testing.T) {
 // 于是每一行都显示「已同步」，整个功能失去意义。
 func TestAttributeUsesOurTagNotTheirs(t *testing.T) {
 	base := col(1, "我方", "UAT", "success")
-	other := col(2, "A公司", "PROD", "success")
+	other := col(2, "A平台", "PROD", "success")
 	plan := Plan{
 		Columns: []Column{base, other},
 		SyncFacts: map[int64]map[string]SyncFact{
@@ -294,7 +294,7 @@ func TestAttributeUsesOurTagNotTheirs(t *testing.T) {
 // 同步失败要带出具体原因，否则人不知道该找谁
 func TestSyncFailedCarriesReason(t *testing.T) {
 	base := col(1, "我方", "UAT", "success")
-	other := col(2, "A公司", "PROD", "success")
+	other := col(2, "A平台", "PROD", "success")
 	plan := Plan{
 		Columns: []Column{base, other},
 		SyncFacts: map[int64]map[string]SyncFact{
@@ -317,7 +317,7 @@ func TestSyncFailedCarriesReason(t *testing.T) {
 // 认不出的状态（进行中等）落到 unknown，不能当成没同步
 func TestInProgressIsUnknownNotUnsynced(t *testing.T) {
 	base := col(1, "我方", "UAT", "success")
-	other := col(2, "A公司", "PROD", "success")
+	other := col(2, "A平台", "PROD", "success")
 	plan := Plan{
 		Columns: []Column{base, other},
 		SyncFacts: map[int64]map[string]SyncFact{
@@ -337,7 +337,7 @@ func TestInProgressIsUnknownNotUnsynced(t *testing.T) {
 // 一致的格子不做归因 —— 没什么可归因的，标上反而是噪音
 func TestNoAttributionForSame(t *testing.T) {
 	base := col(1, "我方", "UAT", "success")
-	other := col(2, "A公司", "PROD", "success")
+	other := col(2, "A平台", "PROD", "success")
 	plan := Plan{
 		Columns: []Column{base, other},
 		SyncFacts: map[int64]map[string]SyncFact{2: {}},

@@ -8,7 +8,7 @@ import (
 
 // Datasource 连接信息，可被多个平台共用。
 //
-// 🔴 从平台里独立出来的理由：同一个 Rancher/ArgoCD/Kite 常被 N 家公司共用。
+// 🔴 从平台里独立出来的理由：同一个 Rancher/ArgoCD/Kite 常被 N 个平台共用。
 // 之前要把地址和凭据重复配 N 遍 —— 改一次密码要改 N 处，
 // 漏一处就是一个平台悄悄采集失败，而失败原因是"认证失败"，
 // 没人会想到是"另外那处忘了改"。
@@ -117,7 +117,7 @@ func (s *Store) DeleteDatasource(ctx context.Context, id int64) error {
 	return err
 }
 
-// Project 一家公司下的一个项目。对比表的一列 = 项目 × 环境。
+// Project 一个平台下的一个项目。对比表的一列 = 项目 × 环境。
 type Project struct {
 	ID    int64  `json:"id"`
 	OrgID int64  `json:"org_id"`
@@ -134,10 +134,18 @@ type Project struct {
 }
 
 func (s *Store) ListProjects(ctx context.Context, orgID int64) ([]Project, error) {
+	// 🔴 必须 JOIN orgs 并检查组织还在不在：只看项目自己的 deleted_at 的话，
+	//    组织被删掉之后它的项目仍会留在列表里 —— 一个属于"看不见的组织"的项目
+	//    常驻项目列表，界面上既删不掉也说不清归属。
+	// ⚠️ DeleteOrg 本身是对的（会级联软删 projects），这类残留是
+	//    级联逻辑补上**之前**删的组织留下的历史数据 —— 所以光修 DeleteOrg 不够，
+	//    查询这一侧也得挡住，否则老数据永远漏出来。
 	q := `SELECT p.id, p.org_id, p.name, p.service_include, p.service_pins,
 	             p.sort_order, p.enabled,
 	             (SELECT COUNT(*) FROM org_envs e WHERE e.project_id = p.id) AS env_count
-	        FROM projects p WHERE p.deleted_at IS NULL`
+	        FROM projects p
+	        JOIN orgs o ON o.id = p.org_id AND o.deleted_at IS NULL
+	       WHERE p.deleted_at IS NULL`
 	args := []any{}
 	if orgID > 0 {
 		q += ` AND p.org_id = ?`

@@ -37,7 +37,7 @@ func TestIgnoreCellDoesNotAffectOtherColumns(t *testing.T) {
 		t.Errorf("行结论 = %s，我方(v2) vs 马来(v1) 应为 diff（忽略印尼不影响它们）", got)
 	}
 	if !res.Rows[0].HasDiff {
-		t.Error("马来和 我方 版本不同，这一行应当算有差异")
+		t.Error("马来和我方版本不同，这一行应当算有差异")
 	}
 	// 🔴 逐格忽略在 Summary（按行统计）里是看不见的 —— 这一行的结论是 diff。
 	//    所以必须有独立的计数，否则"忽略了什么"就藏起来了。

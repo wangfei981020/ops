@@ -122,11 +122,13 @@ func (s *Store) MarkHarborSync(ctx context.Context, id int64, status, errMsg str
 func (s *Store) SavePolicies(ctx context.Context, harborID int64, ps []providers.SyncPolicy) error {
 	for _, p := range ps {
 		if _, err := s.db.ExecContext(ctx, `
-			INSERT INTO sync_policies (harbor_id, policy_id, name, dest_registry, trigger_type, enabled)
-			VALUES (?,?,?,?,?,?)
+			INSERT INTO sync_policies (harbor_id, policy_id, name, dest_registry, src_project, trigger_type, enabled)
+			VALUES (?,?,?,?,?,?,?)
 			ON DUPLICATE KEY UPDATE name=VALUES(name), dest_registry=VALUES(dest_registry),
+			  src_project=VALUES(src_project),
 			  trigger_type=VALUES(trigger_type), enabled=VALUES(enabled)`,
-			harborID, p.PolicyID, p.Name, p.DestRegistry, p.TriggerType, boolToInt(p.Enabled)); err != nil {
+			harborID, p.PolicyID, p.Name, p.DestRegistry, p.SrcProject,
+			p.TriggerType, boolToInt(p.Enabled)); err != nil {
 			return err
 		}
 	}
@@ -370,14 +372,14 @@ func (s *Store) ListExecutions(ctx context.Context, limit int, beforeAt *time.Ti
 	return page, nil
 }
 
-// SyncFact 某个 (组织, 服务, tag) 的同步事实。对账归因用。
+// SyncFact 某个 (平台, 服务, tag) 的同步事实。对账归因用。
 type SyncFact struct {
 	Status     string     `json:"status"`
 	FinishedAt *time.Time `json:"finished_at"`
 	ErrMsg     string     `json:"err_msg"`
 }
 
-// SyncFactsOf 取某个组织所有服务最近一次的同步结果。
+// SyncFactsOf 取某个平台所有服务最近一次的同步结果。
 //
 // 🔴 这是「归因」的数据来源：同样是「对方版本落后」，
 // 这里能告诉你镜像到底推过去了没有 —— 推过去了是对方没发版（对方的节奏），
@@ -430,7 +432,7 @@ func truncate(s string, n int) string {
 // AllSyncFacts 取所有复制规则的同步结果，不分组织。
 //
 // 用于「不限组织」的镜像检查：只要**任一**规则把这个 tag 推成功过就算已同步。
-// ⚠️ 与 SyncFactsOf 的区别要说清：那个回答「推给某个组织了吗」，
+// ⚠️ 与 SyncFactsOf 的区别要说清：那个回答「推给某个平台了吗」，
 // 这个回答「推出去过吗」—— 后者更宽松，用在还没绑定组织的场景。
 func (s *Store) AllSyncFacts(ctx context.Context) (map[string]SyncFact, error) {
 	rows, err := s.db.QueryContext(ctx, `

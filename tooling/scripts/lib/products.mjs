@@ -21,11 +21,7 @@ import { join } from 'node:path'
  *
  * 所以清单必须是**推导出来的**，不是维护出来的。
  */
-// 🔴 仓库根 = tooling/scripts/lib 上溯**三层**。
-//    ⚠️ 层数写错时不会报错，只是 readdirSync 扫到别的目录、
-//    一个产品都发现不了，而守卫照样打印「✓ 全部通过」——
-//    正是这个文件开头说的那种"绿色的谎"。
-const ROOT = new URL('../../../', import.meta.url).pathname
+const ROOT = new URL('../../..', import.meta.url).pathname
 
 /** 所有产品目录名，如 ['另一个产品', '某个同类产品', '另一个产品'] */
 export function products() {

@@ -23,6 +23,7 @@ import {
   colKey,
   colLabel,
   columnsOf,
+  excludedCount,
   type Org,
   type Row,
   respColKey,
@@ -56,6 +57,11 @@ function parseServices(s: string): string[] {
 
 export function ReconPage({ session }: { session: Session }) {
   const { t } = useTranslation()
+  // 视图层级：平台级（把一个平台的所有项目滚成一列）/ 项目级（一列 = 项目 × 环境）
+  //
+  // 🔴 默认平台级：逐项目比会大面积判「缺失」——同一个服务在两个平台的
+  //    不同项目里跑是常态。实测过 5 列逐项目比 = 122 行全缺失、0 条有效结论。
+  //    平台级先回答「两边差在哪」，要看细节再切到项目级。
   const [picked, setPicked] = useState<Set<string> | null>(null)
   const [onlyDiff, setOnlyDiff] = useState(false)
   const [result, setResult] = useState<CompareResult | null>(null)
@@ -97,9 +103,20 @@ export function ReconPage({ session }: { session: Session }) {
     queryFn: () => api<PlanResp[]>('/api/plans'),
   })
 
+  // 一列 = 项目 × 环境。平台名在分组表头上合并显示。
+  //
+  // 🔴 只此一种，不再有「汇总成一列」那档 —— 两档并存时，
+  //    同一个平台在两档里能看到的服务数还不一样（实测生产 122 vs 168），
+  //    而这个差别没有任何界面提示，谁也说不清自己看的是全量还是子集。
   const choices = useMemo(() => columnsOf(orgs.data ?? []), [orgs.data])
-  // 默认全选。用 null 区分「还没初始化」与「用户主动取消了全部」
-  const selected = picked ?? new Set(choices.map(colKey))
+  // 🔴 默认**不选**任何列。
+  //
+  //    原来默认全选，于是首屏必然是「122 行 100% 判缺失」——新用户打开这个
+  //    产品看到的第一眼就是一张全红的无用表格加一条警告。
+  //    列该选哪几个只有用户自己知道，替他猜的代价是让他先看一屏噪音。
+  // ⚠️ 仍然用 null 区分「还没初始化」与「用户主动清空了」——
+  //    切换视图层级时要靠它把上一层的勾选清掉（两层的 colKey 不通用）。
+  const selected = picked ?? new Set<string>()
 
   // ─── 数据新鲜度 ───
   //
@@ -339,13 +356,16 @@ export function ReconPage({ session }: { session: Session }) {
     })
   }, [allRows, keyword, verdictPick])
 
-  // 矩阵的列是**动态**的：一列服务名 + 每个参与对比的 (组织,环境)
+  // 矩阵的列是**动态**的：一列服务名 + 每个参与对比的 (平台,环境)
   const columns = useMemo<ColumnDef<Row, unknown>[]>(() => {
     const head: ColumnDef<Row, unknown>[] = [
       {
         // 批量忽略用。⚠️ 只在**当前结果**里有意义 —— 重新比对后清空，
         // 否则勾着一批上一轮才存在的服务名，点批量忽略会忽略掉看不见的东西。
         id: 'pick',
+        // 固定窄列：只放一个勾选框。不设的话它会跟着表格均分空间 ——
+        // 实测占到 211px，比序号列还宽，看着就是一大片空白
+        size: 44,
         header: () => null,
         cell: ({ row }) => (
           <input
@@ -361,6 +381,34 @@ export function ReconPage({ session }: { session: Session }) {
               })
             }}
           />
+        ),
+      },
+      {
+        // 🔴 序号：让「我滚到哪儿了」有参照。
+        //
+        //    168 行在一个滚动容器里，中间没有任何位置标记 —— 滚一会儿就
+        //    分不清是看过了还是漏了，人的直觉是「怎么少了这么多服务」，
+        //    而实际一行没少（实测 DOM 渲染数 = 统计数 = 168）。
+        //
+        // ⚠️ 序号是**当前视图**的序号，不是数据的原始下标：
+        //    筛选、排序、搜索之后它都从 1 连续排到 N，
+        //    否则排完序看到「1、7、23」会以为中间的行丢了。
+        // 🔴 按 **row.id** 找位置，不能用 indexOf(row)。
+        //
+        //    排序之后 getRowModel().rows 里的对象与传进 cell 的 row **不是同一个引用**，
+        //    indexOf 返回 -1，序号整列变成 0 —— 而默认排序下看不出来，
+        //    要点一下表头排序才暴露（实测：倒序后 7 行全是 0）。
+        //
+        // ⚠️ findIndex 是 O(n²)（每行扫一遍行表），但实测 1000 行整表算一遍
+        //    只要 0.13ms —— 这个规模下换成预建 Map 是没有收益的复杂度。
+        id: 'idx',
+        // 固定窄列：内容最多 3~4 位数字，不该跟着表格均分空间
+        size: 56,
+        header: () => <span className="text-muted-foreground">#</span>,
+        cell: ({ row, table }) => (
+          <span className="tabular-nums text-[11px] text-muted-foreground">
+            {table.getRowModel().rows.findIndex((r) => r.id === row.id) + 1}
+          </span>
         ),
       },
       {
@@ -433,12 +481,38 @@ export function ReconPage({ session }: { session: Session }) {
         header: () => (
           <div>
             {/* 🔴 项目名必须进表头。这张表会被导出、被转发 ——
-                两列都写「A公司/UAT」的话，收到的人分不出哪列是哪个项目，
-                而两列的服务集合本来就不一样，对不上会以为是漏部署。 */}
-            <div>{c.OrgName}</div>
+                两列都写「A平台/UAT」的话，收到的人分不出哪列是哪个项目，
+                而两列的服务集合本来就不一样，对不上会以为是漏部署。
+                ⚠️ 平台名在**分组表头**上（同平台的列合并成一格），
+                这里就不再重复一遍 —— 每列都写一次平台名是纯噪音。 */}
+
             <div className="text-[11px] font-normal text-muted-foreground">
               {c.ProjectName ? `${c.ProjectName} · ${c.Env}` : c.Env}
             </div>
+            {/* 🔴 这里**不再显示「降级采集」**。
+                客户普遍只给 Pod 的读权限（不给 Deployment），所以从 Pod 反推版本
+                是常态而不是故障 —— 每一列都常驻一个黄色警告，等于没有警告，
+                人三天就学会无视它，然后真出问题时也一起无视了。
+                而且「降级采集」是内部术语，拿去跟客户对账的表上出现它，
+                看的人只会以为是我们这边出了故障。
+
+                ⚠️ 信息没有丢，只是挪了地方：
+                  · 采不到的**格子**上写「没有运行中的实例」—— 准确、不用解释
+                  · 「版本从 deployment 还是 pod 取的」进采集日志（version_from）
+                两者合起来，该知道的人查得到，不该被打扰的人不被打扰。 */}
+            {/* 🔴 被规则排掉的数量也要在表头说出来，理由和降级同源 ——
+                这一列少了一批服务，而少的原因是**我们自己配的规则**，不是对方没部署。
+                实测过：一侧排掉了 67 个，对面只有一个项目配了同样规则，
+                于是出现 21 行「一边有版本、一边已忽略」；不标出来的话，
+                人只会看到「服务怎么这么少」，找不到是哪条规则干的。 */}
+            {excludedCount(c) > 0 && (
+              <div
+                className="text-[11px] font-normal text-muted-foreground"
+                title={t('opsversion:recon.excludedHint', { n: excludedCount(c) })}
+              >
+                ⊘ {t('opsversion:recon.excludedCount', { n: excludedCount(c) })}
+              </div>
+            )}
           </div>
         ),
         accessorFn: (r) => r.Cells[idx]?.Snap?.Tag ?? '',
@@ -467,7 +541,44 @@ export function ReconPage({ session }: { session: Session }) {
         },
       })
     })
-    return head
+
+    // 🔴 同一个平台的列收拢到一个分组表头下。
+    //
+    //    改造前每列表头都重复写一遍平台名：
+    //      「甲方公司 / 项目A·UAT」「甲方公司 / 项目B·UAT」「乙方公司 / 项目C·UAT」
+    //    列一多就看不出哪几列是同一家的。合并之后是：
+    //      ┌──── 甲方公司 ────┐ ┌─ 乙方公司 ─┐
+    //      │ 项目A·UAT │ 项目B │ │  项目C·UAT  │
+    //
+    // ⚠️ 只合并**相邻**的同平台列，不重排顺序 —— 列的先后是用户勾选的顺序，
+    //    擅自重排会让人对不上自己刚勾的东西。相邻性由 buildPlan 保证
+    //    （它按平台把列吐出来），万一不相邻就分成两组，如实反映。
+    const fixed = head.slice(0, head.length - cols.length)
+    const colDefs = head.slice(head.length - cols.length)
+    const groups: ColumnDef<Row, unknown>[] = []
+    let run: ColumnDef<Row, unknown>[] = []
+    let runOrg = ''
+    const flush = () => {
+      if (run.length === 0) return
+      // 🔴 必须把 runOrg 的**当前值**抓成局部常量再进闭包。
+      //    直接写 `header: () => <span>{runOrg}</span>` 的话，闭包捕获的是变量本身，
+      //    而 header 要等渲染时才执行 —— 那时 runOrg 早就是最后一个平台名了，
+      //    于是每个分组头都显示成同一家。实测：我方 那组的表头写着「演示·A公司」。
+      const name = runOrg
+      groups.push({ id: `grp-${groups.length}`, header: () => <span>{name}</span>, columns: run })
+      run = []
+    }
+    cols.forEach((c, i) => {
+      const def = colDefs[i]
+      if (!def) return
+      if (c.OrgName !== runOrg) {
+        flush()
+        runOrg = c.OrgName
+      }
+      run.push(def)
+    })
+    flush()
+    return [...fixed, ...groups]
   }, [result, t, checked, ig])
 
   const state = fromQuery(
@@ -607,10 +718,35 @@ export function ReconPage({ session }: { session: Session }) {
               </Banner>
             ) : null}
 
-            {/* 列选择。列是 (组织,环境) 的自由组合 —— 不必同环境对同环境 */}
+            {/* 列选择。列是 (平台,环境) 的自由组合 —— 不必同环境对同环境 */}
             <div className="rounded-lg border border-border bg-card p-3">
-              <div className="mb-2 text-[11px] text-muted-foreground">
-                {t('opsversion:recon.columns')}
+              <div className="mb-2 flex flex-wrap items-center gap-3">
+                {/* 🔴 只有一种视图：勾哪几列就比哪几列。
+                    原来有「平台级 / 汇总」两档 —— 两档回答的问题不同、
+                    看到的服务数还不一样，用的人先得理解这套概念才敢下结论。
+                    实际反馈是「其他人看不懂」，而对账这件事本身很简单：
+                    横着摆几列版本号，一样就是绿的。 */}
+                <span className="text-[11px] text-muted-foreground">
+                  {t('opsversion:recon.pickHint')}
+                </span>
+                <div className="flex-1" />
+                {/* 默认一列都不选，给个一键全选省得逐个点 */}
+                <button
+                  type="button"
+                  onClick={() => setPicked(new Set(choices.map(colKey)))}
+                  className="text-[11px] text-brand hover:underline"
+                >
+                  {t('opsversion:recon.selectAll')}
+                </button>
+                {selected.size > 0 && (
+                  <button
+                    type="button"
+                    onClick={() => setPicked(new Set())}
+                    className="text-[11px] text-muted-foreground hover:underline"
+                  >
+                    {t('opsversion:recon.clearAll')}
+                  </button>
+                )}
               </div>
               <div className="flex flex-wrap gap-3">
                 {choices.map((c) => {
@@ -636,8 +772,25 @@ export function ReconPage({ session }: { session: Session }) {
             {/* 🔴 几乎全是「没有」时提醒列可能选错了。
                 这种结果绝大多数不是两边真的都没部署，而是把两批毫不相干的
                 平台放进了同一次比对 —— 而「全是灰的」和「确实没差异」看起来很像 */}
+            {/* 🔴 一列都没选时必须给引导。默认不选之后首屏本来就是空的，
+                不说话的话人只会看到一排复选框，不知道下一步该干什么。 */}
+            {selected.size === 0 && !result && (
+              <Banner tone="info">{t('opsversion:recon.pickColumnsFirst')}</Banner>
+            )}
+
             {result?.mostly_missing && (
-              <Banner tone="warn">{t('opsversion:recon.mostlyMissing')}</Banner>
+              <Banner tone="warn">
+                {t('opsversion:recon.mostlyMissing')}
+                {/* 能指出具体哪一列时就指出来 —— 用户下一步该做什么变得明确 */}
+                {result.worst_overlap_col && (
+                  <div className="mt-1">
+                    {t('opsversion:recon.worstOverlap', {
+                      col: result.worst_overlap_col,
+                      pct: result.worst_overlap_pct ?? 0,
+                    })}
+                  </div>
+                )}
+              </Banner>
             )}
 
             {/* 🔴 整列采集失败必须显著提示：表面只是几个灰格子，
@@ -680,7 +833,21 @@ export function ReconPage({ session }: { session: Session }) {
                 <div className="flex flex-wrap overflow-hidden rounded-lg border border-border bg-card">
                   {VERDICT_ORDER.map((v) => {
                     const kind = v
-                    const n = result.summary[v] ?? 0
+                    // 🔴 「已忽略」要把**整行忽略**的服务算进来。
+                    //
+                    //    后端对整行忽略的服务是 `continue` —— 它们不进 rows，
+                    //    自然也不进 Summary。于是忽略了 79 个服务，
+                    //    统计条却显示「已忽略 0」，而表头上另有一句「已忽略 79 个服务」，
+                    //    同一个界面上两个数字互相打脸。
+                    //
+                    // ⚠️ 两种来源语义不同，但对看表的人是同一件事「这些我不比」：
+                    //      · 整行忽略（人配的规则）→ 行被移出表格
+                    //      · 采集规则排除          → 行还在，判定为 ignored
+                    //    所以数字合并，而**点击行为**按有没有可筛的行分开（见下）。
+                    const rowsIgnored = v === 'ignored' ? hiddenNames.length : 0
+                    const n = (result.summary[v] ?? 0) + rowsIgnored
+                    // 被移出表格的那些筛不出来 —— 点它只能是"看清单"
+                    const onlyHidden = v === 'ignored' && (result.summary[v] ?? 0) === 0 && n > 0
                     const on = verdictPick === v
                     return (
                       <button
@@ -688,7 +855,11 @@ export function ReconPage({ session }: { session: Session }) {
                         type="button"
                         // 数量为 0 的不让点：点了必然是空表，那不是筛选是死路
                         disabled={n === 0}
-                        onClick={() => setVerdictPick(on ? null : v)}
+                        // 🔴 全部被移出表格时，点它去开忽略清单 ——
+                        //    再怎么筛表格也筛不出不在表里的行，那才是真死路
+                        onClick={() =>
+                          onlyHidden ? setIgnoreOpen(true) : setVerdictPick(on ? null : v)
+                        }
                         aria-pressed={on}
                         className={`relative min-w-[92px] flex-1 border-r border-border px-3 py-2 text-left last:border-r-0 ${
                           n === 0
@@ -769,23 +940,27 @@ export function ReconPage({ session }: { session: Session }) {
 
                       ⚠️ 只有一个 chip：之前「本次隐藏了 N 个」和「已忽略 N 个」
                       并排放，说的是同一件事，两条挤在一起反而没人细看。 */}
-                  {!ig.summary.empty && (
-                    <button
-                      type="button"
-                      onClick={() => setIgnoreOpen(true)}
-                      title={hiddenNames.join('、')}
-                      className="cursor-pointer rounded-md border border-border px-2 py-1 text-[11px] text-muted-foreground hover:border-border-strong hover:text-foreground"
-                    >
-                      {t('opsversion:ignore.summaryRows', {
-                        n: ig.summary.rows,
-                        names: hiddenNames.slice(0, 3).join('、'),
-                        more: hiddenNames.length > 3 ? '…' : '',
-                      })}
-                      {/* 格子数为 0 时不显示 ——「· 0 个格子」是纯噪音 */}
-                      {ig.summary.cells > 0 &&
-                        ` · ${t('opsversion:ignore.summaryCells', { n: ig.summary.cells })}`}
-                    </button>
-                  )}
+                  {/* 🔴 一条规则都没有时**也要有入口**。
+                      原来这里是 `!ig.summary.empty &&` —— 于是只有已经忽略过东西的人
+                      才打得开忽略管理，而想第一次加规则的人根本进不去。
+                      「必须先有一条才能加第二条」，弹窗内部也犯过同一个错。 */}
+                  <button
+                    type="button"
+                    onClick={() => setIgnoreOpen(true)}
+                    title={ig.summary.empty ? undefined : hiddenNames.join('、')}
+                    className="cursor-pointer rounded-md border border-border px-2 py-1 text-[11px] text-muted-foreground hover:border-border-strong hover:text-foreground"
+                  >
+                    {ig.summary.empty
+                      ? t('opsversion:ignore.manageEmpty')
+                      : t('opsversion:ignore.summaryRows', {
+                          n: ig.summary.rows,
+                          names: hiddenNames.slice(0, 3).join('、'),
+                          more: hiddenNames.length > 3 ? '…' : '',
+                        })}
+                    {/* 格子数为 0 时不显示 ——「· 0 个格子」是纯噪音 */}
+                    {ig.summary.cells > 0 &&
+                      ` · ${t('opsversion:ignore.summaryCells', { n: ig.summary.cells })}`}
+                  </button>
                 </div>
 
                 {/* 筛完一行都不剩时要说清是筛没的，不是没数据 */}
@@ -815,6 +990,8 @@ export function ReconPage({ session }: { session: Session }) {
               open={ignoreOpen}
               ignores={ig.ignores}
               labelOf={labelOfStable}
+              hiddenNames={hiddenNames}
+              onAddService={(p) => ig.ignoreServices([p])}
               onUnignoreService={ig.unignoreService}
               onUnignoreCell={ig.unignoreCell}
               onClearAll={() => {

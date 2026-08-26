@@ -54,7 +54,7 @@ func (c *Collector) notifyExecution(ctx context.Context, execRef int64, orgID in
 		if !ch.Enabled || ch.WebhookEnc == "" {
 			continue
 		}
-		// 渠道绑了组织就只发那个组织的
+		// 渠道绑了平台就只发那个平台的
 		if ch.OrgID != nil && *ch.OrgID != orgID {
 			continue
 		}

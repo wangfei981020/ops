@@ -320,7 +320,7 @@ function RoleForm({
             </label>
           ))}
         </div>
-        {/* ⚠️ 说清楚 sync.trigger 的分量：它是真的往对方公司的 Harbor 推镜像，
+        {/* ⚠️ 说清楚 sync.trigger 的分量：它是真的往对方平台的 Harbor 推镜像，
             改配置错了能改回来，推镜像推不回来。 */}
         <div className="mt-1 text-[11px] text-muted-foreground">{t('opsversion:roleAdmin.permsHint')}</div>
       </div>

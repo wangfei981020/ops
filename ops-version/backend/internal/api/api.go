@@ -276,6 +276,13 @@ func (s *Server) Routes() http.Handler {
 	mux.HandleFunc("GET /api/sync/executions", s.requires(auth.PermView, s.listExecutions))
 	mux.HandleFunc("GET /api/columns/freshness", s.requires(auth.PermView, s.columnFreshness))
 	mux.HandleFunc("POST /api/sync/refresh", s.requires(auth.PermSyncTrigger, s.syncHarborsNow))
+	// Harbor webhook 接收端。
+	// 🔴 **不挂 requires**：Harbor 不会带 cookie，它只会带我们让它带的 Auth Header，
+	//    认证在 handler 里自己做（常量时间比较令牌哈希）。
+	mux.HandleFunc("POST /api/webhooks/harbor", s.harborHook)
+	mux.HandleFunc("GET /api/webhooks/tokens", s.requires(auth.PermOrgWrite, s.webhookInfo))
+	mux.HandleFunc("POST /api/webhooks/tokens", s.requires(auth.PermOrgWrite, s.createWebhookToken))
+	mux.HandleFunc("DELETE /api/webhooks/tokens/{id}", s.requires(auth.PermOrgWrite, s.deleteWebhookToken))
 
 	// 通知渠道。webhook 等同于凭据，写操作要 alert.write
 	mux.HandleFunc("GET /api/notify/channels", s.requires(auth.PermView, s.listChannels))

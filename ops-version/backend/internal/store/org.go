@@ -6,9 +6,10 @@ import (
 	"fmt"
 	"strings"
 	"time"
+
 )
 
-// Org 一个部署组织。我方也是一条普通记录，不是特例。
+// Org 一个部署平台。我方也是一条普通记录，不是特例。
 type Org struct {
 	ID           int64
 	Name         string
@@ -43,13 +44,34 @@ type Org struct {
 	Envs []OrgEnv
 }
 
-// OrgEnv 一个组织的一个环境。
+// OrgEnv 一个平台的一个环境。
 type OrgEnv struct {
 	Env string
 
 	// 🔴 一个环境可以跨多个集群。
 	//    Kite 填 cluster name（一个 Kite 接多个集群）；Rancher 填 clusterId（c-m-xxxx）
 	ClusterRefs []string
+
+	// DatasourceID 这个环境用哪个数据源。0 = 沿用下一层（见 Conn）。
+	//
+	// 🔴 客户的 UAT / PROD 常常是两套独立的 Rancher —— 有了这个字段，
+	//    两套各建一个数据源、各环境各选各的即可，凭据只配一处。
+	//    否则同一套 PROD 的账号密码有几个项目就要手填几遍，
+	//    改密码时漏掉一处，表现是那一列「认证失败」，而人会去查账号本身。
+	DatasourceID int64
+	// DSProviderType 这个数据源是什么系统（kite / rancher / argocd）。
+	//
+	// 🔴 类型必须跟着环境的数据源走，不能只跟着平台走。
+	//    同一个客户 UAT 是 Rancher、PROD 是 ArgoCD 是完全正常的场景 ——
+	//    只让地址和凭据跟着环境、类型仍用平台的，就会拿 rancher 的协议
+	//    去连 ArgoCD 的地址。实测过过：错误是
+	//    `Post https://slib-argocd.../v3-public/localProviders/local?action=login: i/o timeout`
+	//    ——地址是 ArgoCD 的，端点却是 Rancher 的，而配置每一项看着都对。
+	DSProviderType  string
+	DSEndpoint      string
+	DSAuthType      string
+	DSCredentialEnc string
+	DSName          string
 
 	NSInclude []string
 	NSExclude []string
@@ -74,8 +96,13 @@ type OrgEnv struct {
 	LastCollectAt     sql.NullTime
 	LastCollectStatus string
 	LastCollectError  string
+	// LastCollectDegraded 上次采集走了降级路径（读不到 deployments，从 Pod 反推）。
+	// 🔴 降级时**副本为 0 的服务采不到**，对账时会显示成「该平台未部署此服务」——
+	//    这个标记要一路传到对账表头，让人知道这一列的 missing 不是确定结论。
+	LastCollectDegraded     bool
+	LastCollectDegradedNote string
 
-	// 🔴 连接覆盖：留空则继承组织级。
+	// 🔴 连接覆盖：留空则继承平台级。
 	//    我方 Kite 一个 endpoint 打多个集群 → 全留空。
 	//    客户有两套 Rancher（UAT 一个、PROD 一个）→ 每个环境各填各的。
 	Endpoint      string
@@ -96,7 +123,13 @@ type OrgEnv struct {
 // 逐字段回落会造出「A 的地址配 B 的密码」这种谁都想不到的组合，
 // 排查时看配置每一项都对，就是连不上。
 func (e OrgEnv) Conn(inst Org) (endpoint, authType, credEnc string) {
-	// 环境级整组覆盖（最高优先级）
+	// 环境引用的数据源（最高优先级）。
+	// 🔴 排在手填之前：一个环境同时有数据源和手填时，人的意图必然是"用我选的那个数据源"——
+	//    手填的往往是改用数据源之前留下的旧值，让旧值赢会让"我明明选了数据源"变成灵异事件。
+	if strings.TrimSpace(e.DSEndpoint) != "" {
+		return e.DSEndpoint, e.DSAuthType, e.DSCredentialEnc
+	}
+	// 环境级整组覆盖
 	if strings.TrimSpace(e.Endpoint) != "" {
 		return e.Endpoint, e.AuthType, e.CredentialEnc
 	}
@@ -115,6 +148,8 @@ func (e OrgEnv) Conn(inst Org) (endpoint, authType, credEnc string) {
 // 没有这个的话，人会反复去改一个根本没被读到的字段。
 func (e OrgEnv) ConnSource(inst Org) string {
 	switch {
+	case strings.TrimSpace(e.DSEndpoint) != "":
+		return "env_datasource"
 	case strings.TrimSpace(e.Endpoint) != "":
 		return "env"
 	case strings.TrimSpace(inst.Endpoint) != "":
@@ -126,7 +161,7 @@ func (e OrgEnv) ConnSource(inst Org) string {
 	}
 }
 
-// ListOrgs 读出所有启用的组织及其环境映射。
+// ListOrgs 读出所有启用的平台及其环境映射。
 func (s *Store) ListOrgs(ctx context.Context, onlyEnabled bool) ([]Org, error) {
 	// ⚠️ LEFT JOIN 而不是 JOIN：没绑数据源的平台（manual_import、
 	//    或迁移期还用着自己连接信息的）也必须查得出来，否则它们会整个消失。
@@ -176,12 +211,19 @@ func (s *Store) ListOrgs(ctx context.Context, onlyEnabled bool) ([]Org, error) {
 		return list, nil
 	}
 
+	// ⚠️ LEFT JOIN datasources：环境可以引用数据源（UAT/PROD 各一套 Rancher 时用）。
+	//    没引用的环境 d.* 全为 NULL，走 COALESCE 兜成空串，行为与升级前一致。
 	erows, err := s.db.QueryContext(ctx, `
-		SELECT org_id, env, cluster_refs, ns_include, ns_exclude,
-		       workload_include, workload_exclude, compare_enabled,
-		       endpoint, auth_type, credential_enc, project_id,
-		       last_collect_at, last_collect_status, last_collect_error
-		  FROM org_envs ORDER BY id`)
+		SELECT e.org_id, e.env, e.cluster_refs, e.ns_include, e.ns_exclude,
+		       e.workload_include, e.workload_exclude, e.compare_enabled,
+		       e.endpoint, e.auth_type, e.credential_enc, e.project_id,
+		       e.last_collect_at, e.last_collect_status, e.last_collect_error,
+		       e.last_collect_degraded, e.last_collect_degraded_note,
+		       COALESCE(e.datasource_id,0), COALESCE(d.name,''), COALESCE(d.provider_type,''),
+		       COALESCE(d.endpoint,''), COALESCE(d.auth_type,''), d.credential_enc
+		  FROM org_envs e
+		  LEFT JOIN datasources d ON d.id = e.datasource_id AND d.deleted_at IS NULL
+		 ORDER BY e.id`)
 	if err != nil {
 		return nil, err
 	}
@@ -189,20 +231,27 @@ func (s *Store) ListOrgs(ctx context.Context, onlyEnabled bool) ([]Org, error) {
 	for erows.Next() {
 		var iid int64
 		var e OrgEnv
-		var refs, inc, exc, winc, wexc, cred sql.NullString
+		var refs, inc, exc, winc, wexc, cred, dsCred sql.NullString
 		var pid sql.NullInt64
 		var cmp int
+		// TINYINT(1) 扫进 int 再转 bool —— 与 compare_enabled 同一套写法
+		var degraded int
 		if err := erows.Scan(&iid, &e.Env, &refs, &inc, &exc, &winc, &wexc, &cmp,
 			&e.Endpoint, &e.AuthType, &cred, &pid,
-			&e.LastCollectAt, &e.LastCollectStatus, &e.LastCollectError); err != nil {
+			&e.LastCollectAt, &e.LastCollectStatus, &e.LastCollectError,
+			&degraded, &e.LastCollectDegradedNote,
+			&e.DatasourceID, &e.DSName, &e.DSProviderType,
+			&e.DSEndpoint, &e.DSAuthType, &dsCred); err != nil {
 			return nil, err
 		}
+		e.DSCredentialEnc = dsCred.String
 		e.ClusterRefs = splitLines(refs.String)
 		e.NSInclude = splitLines(inc.String)
 		e.NSExclude = splitLines(exc.String)
 		e.WorkloadInclude = splitLines(winc.String)
 		e.WorkloadExclude = splitLines(wexc.String)
 		e.CompareEnabled = cmp == 1
+		e.LastCollectDegraded = degraded == 1
 		e.CredentialEnc = cred.String
 		e.ProjectID = pid.Int64
 		if i, ok := idx[iid]; ok {
@@ -435,13 +484,18 @@ func (s *Store) saveOrg(ctx context.Context, id int64, in OrgInput) (int64, erro
 		if _, err := tx.ExecContext(ctx, `
 			INSERT INTO org_envs (org_id, env, cluster_refs, ns_include, ns_exclude,
 			  workload_include, workload_exclude,
-			  compare_enabled, endpoint, auth_type, credential_enc, project_id)
-			VALUES (?,?,?,?,?,?,?,?,?,?,?,?)`,
+			  compare_enabled, endpoint, auth_type, credential_enc, project_id, datasource_id)
+			VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)`,
 			id, e.Env, joinLines(e.ClusterRefs),
 			joinLines(e.NSInclude), joinLines(e.NSExclude),
 			joinLines(e.WorkloadInclude), joinLines(e.WorkloadExclude),
 			boolToInt(e.CompareEnabled), e.Endpoint, e.AuthType,
-			nullIfEmpty(e.CredentialEnc), e.ProjectID); err != nil {
+			nullIfEmpty(e.CredentialEnc), e.ProjectID,
+			// 🔴 必须跟着一起写回。SaveOrg 是**整组重写**环境行 ——
+			//    漏写这个字段，人选好的数据源会在下一次保存平台时被悄悄清空，
+			//    表现是"某一列突然连不上了"，而配置页上看不出任何异常
+			//    （project_id 就踩过这个坑，见它上面的注释）。
+			nullIfZero64(e.DatasourceID)); err != nil {
 			return 0, err
 		}
 	}
@@ -496,13 +550,35 @@ type Change struct {
 	NewTag     string    `json:"new_tag"`
 	ChangeType string    `json:"change_type"`
 	ChangedAt  time.Time `json:"changed_at"`
+
+	// SuspectRuleChange 这条「下线」很可能是**改采集规则**造成的，不是服务真的下线。
+	//
+	// 🔴 判据：这条记录说某服务消失了，而该服务此刻**仍被采集规则排除着** ——
+	//    说明它当时是"我们不再采它"，不是"它没了"。
+	//
+	//    实测过（2026-08-24）：172 条 removed 里有 62 条属于这种情况，
+	//    分布在 8/20 与 8/23 的五个时刻上。这类假下线会让
+	//    「这个服务最近改过什么」这一能力不可信，通知渠道一旦配上还会直接发出
+	//    「服务下线」告警。
+	//
+	// ⚠️ 刻意**不改动历史数据**：查询时标注而不是删记录 ——
+	//    ① 删了就无法回答"当初为什么记了这一条"；
+	//    ② 判据依赖"当前规则"，而规则会变；标注是算出来的，规则一改标记自动跟着变，
+	//       删除则是一次性的、判错了也回不来。
+	SuspectRuleChange bool `json:"suspect_rule_change"`
 }
 
 func (s *Store) ListChanges(ctx context.Context, orgID int64, serviceKey string, limit int) ([]Change, error) {
 	// 统一口径见 paging.go：超上限**钳制**到上限，不掉回默认值
 	limit = ClampLimit(limit)
+	// LEFT JOIN excluded_services：标出那些「服务其实还被规则排着」的假下线。
+	// ⚠️ 用 EXISTS 而不是 JOIN 出多行 —— 一个服务可能有多条排除记录
+	//    （多个 workload 指向同一个镜像名），JOIN 会让变更记录重复。
 	q := `SELECT c.org_id, i.name, c.env, c.service_key, c.old_tag, c.new_tag,
-	             c.change_type, c.changed_at
+	             c.change_type, c.changed_at,
+	             EXISTS(SELECT 1 FROM excluded_services e
+	                     WHERE e.org_id=c.org_id AND e.env=c.env
+	                       AND e.service_key=c.service_key) AS suspect
 	        FROM version_changes c JOIN orgs i ON i.id=c.org_id WHERE 1=1`
 	var args []any
 	if orgID > 0 {
@@ -524,10 +600,13 @@ func (s *Store) ListChanges(ctx context.Context, orgID int64, serviceKey string,
 	out := []Change{}
 	for rows.Next() {
 		var c Change
+		var suspect int
 		if err := rows.Scan(&c.OrgID, &c.OrgName, &c.Env, &c.ServiceKey,
-			&c.OldTag, &c.NewTag, &c.ChangeType, &c.ChangedAt); err != nil {
+			&c.OldTag, &c.NewTag, &c.ChangeType, &c.ChangedAt, &suspect); err != nil {
 			return nil, err
 		}
+		// 只有「下线」才谈得上"是不是假的"；升级/新增不适用
+		c.SuspectRuleChange = suspect == 1 && c.ChangeType == "removed"
 		out = append(out, c)
 	}
 	return out, rows.Err()
@@ -637,15 +716,33 @@ func nullIfEmpty(s string) any {
 // 🔴 失败也必须落库。只记成功的话，"上次采集时刻"会永远停在最后一次成功上，
 // 于是"半小时前试过但失败了"和"半小时没跑过"看起来一模一样 ——
 // 而这两者要做的事完全不同（前者去查权限/网络，后者去查定时任务）。
-func (s *Store) MarkEnvCollect(ctx context.Context, orgID, projectID int64, env, status, errMsg string) error {
-	errMsg = clipText(errMsg, 500)
+func (s *Store) MarkEnvCollect(ctx context.Context, orgID, projectID int64, env string, r EnvCollectResult) error {
+	errMsg := clipText(r.ErrMsg, 500)
 	// ⚠️ 必须带 project_id：一个平台的同一环境现在可能有多行（每个项目一行）。
 	//    不带的话，A 项目采失败会把 B 项目那行也标成失败 ——
 	//    B 的比对列于是显示"数据不可用"，而它其实采得好好的。
 	_, err := s.db.ExecContext(ctx, `
-		UPDATE org_envs SET last_collect_at = NOW(), last_collect_status = ?, last_collect_error = ?
-		 WHERE org_id = ? AND project_id = ? AND env = ?`, status, errMsg, orgID, projectID, env)
+		UPDATE org_envs SET last_collect_at = NOW(), last_collect_status = ?, last_collect_error = ?,
+		       last_collect_degraded = ?, last_collect_degraded_note = ?
+		 WHERE org_id = ? AND project_id = ? AND env = ?`,
+		r.Status, errMsg, boolToInt(r.Degraded), clipText(r.DegradedNote, 255),
+		orgID, projectID, env)
 	return err
+}
+
+// EnvCollectResult 一次采集尝试的结果。
+//
+// ⚠️ 用结构体而不是继续加参数：这个函数已经有 5 个参数，
+// 再加两个位置参数，调用点就成了一串没有名字的字面量 ——
+// 传错顺序编译器不会报错（都是 string/bool），而症状是状态被写反。
+type EnvCollectResult struct {
+	Status string
+	ErrMsg string
+	// Degraded 这一轮走了降级路径（读不到 deployments，从 Pod 反推）。
+	// 🔴 必须落库才能传到对账表头 —— 只写日志的话，看表的人永远看不到，
+	//    而降级会让副本为 0 的服务显示成「该平台未部署此服务」。
+	Degraded     bool
+	DegradedNote string
 }
 
 // ColumnFreshness 一列（平台×环境）的数据新鲜度。
@@ -705,4 +802,15 @@ func (s *Store) ListColumnFreshness(ctx context.Context) ([]ColumnFreshness, err
 		out = append(out, c)
 	}
 	return out, rows.Err()
+}
+
+
+// nullIfZero64 0 存成 NULL。
+//
+// ⚠️ 外键列存 0 会撞上"没有 id=0 的数据源"，而 NULL 才是"没引用"的正确表达。
+func nullIfZero64(v int64) any {
+	if v == 0 {
+		return nil
+	}
+	return v
 }

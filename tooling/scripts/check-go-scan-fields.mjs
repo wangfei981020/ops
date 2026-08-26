@@ -37,7 +37,7 @@
  */
 
 import { existsSync, readFileSync, readdirSync, statSync } from 'node:fs'
-import { join, relative } from 'node:path'
+import { dirname, join, relative } from 'node:path'
 import { ROOT, products } from './lib/products.mjs'
 
 function walk(dir, out = []) {
@@ -59,6 +59,29 @@ const problems = []
 let checked = 0
 
 for (const prod of TARGETS) {
+  // 同包（= 同目录）所有 .go 拼在一起，只用来判「字段有没有被填充」。
+  //
+  // 🔴 填充**经常发生在另一个文件**里：结构体定义在 org.go，
+  //    而给它赋值的加载函数在同一个包的 scope.go —— 这是完全正常的 Go 组织方式。
+  //    只看单文件会把它报成"永远是零值"，而这个字段明明填了。
+  //
+  // ⚠️ 只放宽"填充"这一侧的搜索范围，**结构体与 Scan 的配对仍限本文件** ——
+  //    否则两个文件里各有一个同名类型时会互相顶掉，那才是真漏报。
+  const pkgCache = new Map()
+  const pkgSrcOf = (file) => {
+    const dir = dirname(file)
+    if (!pkgCache.has(dir)) {
+      let all = ''
+      for (const f of readdirSync(dir)) {
+        if (f.endsWith('.go') && !f.endsWith('_test.go')) {
+          all += readFileSync(join(dir, f), 'utf8') + '\n'
+        }
+      }
+      pkgCache.set(dir, all)
+    }
+    return pkgCache.get(dir)
+  }
+
   for (const file of walk(join(ROOT, prod, 'backend'))) {
     const src = readFileSync(file, 'utf8')
     if (!src.includes('rows.Scan(') && !src.includes('QueryRow')) continue
@@ -107,11 +130,13 @@ for (const prod of TARGETS) {
         //   ① 单独赋值      in.CredentialEnc = cred.String
         //   ② 多重赋值      d.InsecureTLS, d.Enabled = insecure == 1, enabled == 1
         //   ③ 取地址填充    json.Unmarshal([]byte(cj), &p.Columns)
+        // ⚠️ 在**同包**范围内找填充，不只本文件 —— 见 pkgSrcOf 的说明
+        const hay = pkgSrcOf(file)
         const filled =
           // ①②：同一行内，`=` 左边出现 .Field
-          new RegExp(`^[^=\\n]*\\.${f}\\b[^=\\n]*=`, 'm').test(src) ||
+          new RegExp(`^[^=\\n]*\\.${f}\\b[^=\\n]*=`, 'm').test(hay) ||
           // ③：被取地址传给别的函数（Unmarshal / Decode / Scan 之外的填充）
-          new RegExp(`&\\w+\\.${f}\\b`).test(src)
+          new RegExp(`&\\w+\\.${f}\\b`).test(hay)
         if (filled) continue
         problems.push({
           file: relative(ROOT, file),

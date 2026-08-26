@@ -4,7 +4,7 @@ import "testing"
 
 // 🔴 行结论的优先级：**缺失 > 不一致 > 无法判定 > 一致**。
 //
-// 这个顺序被真实数据推翻过**两次**，两次都是同一个形状 ——
+// 这个顺序被真实数据推翻过**三次**，三次都是同一个形状 ——
 // 优先级高的那一档把低的那一档的事实盖掉了，而**两次单测都是绿的**
 // （因为我把想错的预期也写进了断言）。
 //
@@ -58,10 +58,19 @@ func TestRowVerdictPriority(t *testing.T) {
 		{"整行逐格忽略光了", []Cell{ign, ign}, VerdictIgnored},
 		{"忽略 + 其余仍有差异", []Cell{ver("v1"), ver("v2"), ign}, VerdictDiff},
 
-		// ── 边界 ──
-		// 只剩一个版本号可比 = 没有"不一致"可言
-		{"只配了一个平台", []Cell{ver("v1")}, VerdictSame},
-		{"其余列全被忽略", []Cell{ver("v1"), ign}, VerdictSame},
+		// ── 第三次翻车：只剩一个版本号时判了「一致」 ──
+		// 原来这两条断言的是 same，理由写着
+		// 「只剩一个版本号可比 = 没有『不一致』可言」——
+		// 🔴 前半句对，后半句错：**没查出差异 ≠ 确认相同**。
+		//
+		// 生产平台级视图 62 行「一致」里有 21 行是这么来的：
+		// 我方 那一格被 workload_exclude 排掉、根本没取到版本，
+		// 整行只有 A公司 一个值，于是"全都相同"恒成立。
+		{"只配了一个平台：无从比较", []Cell{ver("v1")}, VerdictUnknown},
+		{"其余列全被排除：归已忽略", []Cell{ver("v1"), ign}, VerdictIgnored},
+		{"多列被排除只剩一个值", []Cell{ign, ign, ver("v1")}, VerdictIgnored},
+		// ⚠️ 排除不能盖掉查实的事实 —— 优先级仍在缺失/不一致之后
+		{"排除 + 缺失：缺失优先", []Cell{ign, missing, ver("v1")}, VerdictMissing},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
@@ -78,3 +87,4 @@ func TestRowVerdictEmpty(t *testing.T) {
 		t.Errorf("= %q，空输入要 %q（不能兜成「一致」）", got, VerdictUnknown)
 	}
 }
+

@@ -32,7 +32,7 @@ type Config struct {
 	MySQLPassword string
 	MySQLDatabase string
 
-	// EncryptKey 加密组织凭据（Rancher/Kite 的密码与 token）。
+	// EncryptKey 加密平台凭据（Rancher/Kite 的密码与 token）。
 	// 🔴 没有默认值：一旦给了默认值，多半就有人用默认值上生产，
 	//    那等于凭据是明文存的。
 	EncryptKey string
@@ -85,7 +85,7 @@ func Load() (*Config, error) {
 		missing = append(missing, "MYSQL_PASSWORD")
 	}
 	if len(c.EncryptKey) < 16 {
-		missing = append(missing, "ENCRYPT_KEY（至少 16 字符，用于加密组织凭据）")
+		missing = append(missing, "ENCRYPT_KEY（至少 16 字符，用于加密平台凭据）")
 	}
 	if len(c.JWTSecret) < 16 {
 		missing = append(missing, "JWT_SECRET（至少 16 字符）")

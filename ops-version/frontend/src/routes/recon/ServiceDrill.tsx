@@ -14,6 +14,13 @@ interface Change {
   new_tag: string
   change_type: string
   changed_at: string
+  /**
+   * 这条「下线」很可能是改采集规则造成的，不是服务真的下线。
+   *
+   * 🔴 实测过 172 条 removed 里有 62 条属于这种 —— 不标出来的话，
+   *    「这个服务最近改过什么」这个能力就是不可信的。
+   */
+  suspect_rule_change?: boolean
 }
 
 /**
@@ -165,6 +172,17 @@ export function ServiceDrill({ row, onClose }: { row: Row; onClose: () => void }
                           <Badge tone={c.change_type === 'rollback' ? 'warn' : 'mute'}>
                             {t(`opsversion:changeType.${c.change_type}`)}
                           </Badge>
+                          {/* 🔴 假下线必须标出来：这条记录说服务消失了，
+                              而它此刻仍被采集规则排除着 —— 当时是"我们不再采它"，
+                              不是"它没了"。不标的话这段历史会被当成真的。 */}
+                          {c.suspect_rule_change && (
+                            <span
+                              className="ml-1 text-[11px] text-warning"
+                              title={t('opsversion:changeType.suspectRuleHint')}
+                            >
+                              ⚠ {t('opsversion:changeType.suspectRule')}
+                            </span>
+                          )}
                         </td>
                         <td className="py-1.5 font-mono">
                           <span className="text-muted-foreground">{c.old_tag || '—'}</span>

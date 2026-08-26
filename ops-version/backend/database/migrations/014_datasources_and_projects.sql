@@ -36,7 +36,7 @@ CREATE TABLE IF NOT EXISTS datasources (
 CREATE TABLE IF NOT EXISTS projects (
   id          BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
   org_id      BIGINT UNSIGNED NOT NULL,
-  name        VARCHAR(64)  NOT NULL COMMENT '项目名，如 G66',
+  name        VARCHAR(64)  NOT NULL COMMENT '项目名，如 项目B',
   -- 🔴 同一个 ns 里区分多项目的三档（按优先级，够用即止）：
   --   ① ns 隔离      → 环境的 ns 规则就够，这里留空
   --   ② 名字有规律   → service_include 写通配，如 biz-*

@@ -319,6 +319,7 @@ type podList struct {
 // 那种情况只能回退到全量请求，也就仍然需要全局权限。
 func (k *Kite) ListServices(ctx context.Context, cluster string, rules Rules, withRuntime bool) (*ListResult, error) {
 	var rows []rawWorkload
+	var excluded []ExcludedService
 	exactNS, expanded := k.resolveNamespaces(ctx, cluster, rules)
 	// 🔴 展开成功却零命中 → 明确报出来，不要回退整集群（见 rancher.go 同一条）
 	if expanded && len(exactNS) == 0 {
@@ -351,6 +352,15 @@ func (k *Kite) ListServices(ctx context.Context, cluster string, rules Rules, wi
 			// workload 级过滤：各家部署的服务集合并不相同，
 			// 只按 ns 抄会让对账表多出一堆「对方没有」的噪音行
 			if !rules.Workload.Match(it.Metadata.Name) {
+				// 记下被排掉的服务名
+				for _, c := range it.Spec.Template.Spec.Containers {
+					if ref := imageref.Parse(c.Image); ref.Name != "" {
+						excluded = append(excluded, ExcludedService{
+							ServiceKey: ref.Name, Workload: it.Metadata.Name,
+							Namespace: it.Metadata.Namespace,
+						})
+					}
+				}
 				continue
 			}
 			for _, c := range it.Spec.Template.Spec.Containers {
@@ -364,7 +374,7 @@ func (k *Kite) ListServices(ctx context.Context, cluster string, rules Rules, wi
 		}
 	}
 
-	out := &ListResult{Services: buildSnapshots(rows, nil)}
+	out := &ListResult{Services: buildSnapshots(rows, nil), Excluded: excluded}
 	if withRuntime {
 		out.Pods = k.fillRuntime(ctx, cluster, rules, exactNS, out.Services)
 	}

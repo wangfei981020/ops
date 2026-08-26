@@ -14,7 +14,7 @@ import (
 // 🔴 名字对不上时**报错**，不是静默不筛。
 //
 //	静默的结果是 AI 拿到一份跨项目全量，却以为是某一个项目的清单 ——
-//	它不会怀疑，会直接拿去回答「G66 上线了哪些服务」。
+//	它不会怀疑，会直接拿去回答「项目B 上线了哪些服务」。
 //	对人来说少一列很显眼，对 AI 来说多一堆服务完全看不出来。
 //
 // 留空 = 不筛，跨项目全量。这是 MCP 的合理默认：调用方按「平台+环境」寻址，
@@ -42,7 +42,7 @@ func applyProjectFilter(ctx context.Context, st *store.Store, col *compare.Colum
 	for _, p := range list {
 		names = append(names, p.Name)
 	}
-	return fmt.Errorf("组织 %s 下没有项目 %q，现有：%s",
+	return fmt.Errorf("平台 %s 下没有项目 %q，现有：%s",
 		col.OrgName, name, strings.Join(names, "、"))
 }
 

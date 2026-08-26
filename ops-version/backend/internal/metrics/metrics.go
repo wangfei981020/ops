@@ -6,7 +6,7 @@
 // 🔴 标签叫 org 而**不能叫 instance**：instance 是 Prometheus 的保留标签，
 // 抓取时会被自动注入为 `instance="<pod_ip>:<port>"`。业务指标自带同名标签时，
 // Prometheus 在 relabel 阶段把我们这份改名成 exported_instance —— 于是
-// `sum by (instance) (...)` 分组分出来的是 Pod IP 而不是组织名，
+// `sum by (instance) (...)` 分组分出来的是 Pod IP 而不是平台名，
 // 告警文案里显示的也是 IP。这类冲突不报错、不掉数据，只是**悄悄换掉了含义**。
 package metrics
 
@@ -21,7 +21,7 @@ var (
 	// 好让「界面上看到的失败」和「告警里看到的失败」是同一个口径。
 	CollectTotal = promauto.NewCounterVec(prometheus.CounterOpts{
 		Name: "opsversion_collect_total",
-		Help: "采集执行次数，按组织/环境/结果分类",
+		Help: "采集执行次数，按平台/环境/结果分类",
 	}, []string{"org", "env", "status"})
 
 	CollectDuration = promauto.NewHistogramVec(prometheus.HistogramOpts{
@@ -35,11 +35,11 @@ var (
 	// 🔴 这是本系统最该配告警的一条：
 	//     time() - opsversion_last_success_timestamp_seconds > 3600
 	//
-	// 对账最危险的失效方式不是「报错」，而是**某个组织悄悄停止更新**——
+	// 对账最危险的失效方式不是「报错」，而是**某个平台悄悄停止更新**——
 	// 界面上那一列会变成 no_data，但没人一直盯着界面。
 	//
 	// 用「最后成功时间」而不是「失败计数」做告警，是因为采集根本没跑起来时
-	// （cron 挂了、Pod 一直 CrashLoop、组织被误删）**失败计数也不会增长**，
+	// （cron 挂了、Pod 一直 CrashLoop、平台被误删）**失败计数也不会增长**，
 	// 那种情况下失败数是 0，看起来一切正常 —— 而这恰恰是最该被发现的故障。
 	LastSuccessTimestamp = promauto.NewGaugeVec(prometheus.GaugeOpts{
 		Name: "opsversion_last_success_timestamp_seconds",
@@ -77,12 +77,12 @@ func EnsureNotify() {
 	}
 }
 
-// Ensure 为一个 (组织, 环境) 预置全部指标。
+// Ensure 为一个 (平台, 环境) 预置全部指标。
 //
 // 🔴 **必须在采集之前调用**，否则告警是失效的。
 //
 // Prometheus 的 *Vec 在没有任何 label 组合被使用过时**不输出任何样本**。
-// 于是一个从未成功采集过的组织（token 一开始就错、网络从头不通），
+// 于是一个从未成功采集过的平台（token 一开始就错、网络从头不通），
 // opsversion_last_success_timestamp_seconds 压根不存在，
 // PromQL 的 `time() - x > 3600` 返回空集 —— **告警永远不会触发**。
 //

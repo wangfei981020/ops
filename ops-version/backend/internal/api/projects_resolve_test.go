@@ -65,7 +65,7 @@ func TestResolveProjectNone(t *testing.T) {
 	}
 }
 
-// 单项目平台不显示项目名 —— 「A公司·默认/UAT」是纯噪音
+// 单项目平台不显示项目名 —— 「A平台·默认/UAT」是纯噪音
 func TestCountEnabledProjects(t *testing.T) {
 	if n := countEnabledProjects(projs()); n != 2 {
 		t.Errorf("启用项目数 = %d，要 2（停用的不算）", n)

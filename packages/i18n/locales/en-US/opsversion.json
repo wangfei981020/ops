@@ -54,6 +54,7 @@
     "savePlan": "Save as plan",
     "columns": "Columns to compare (any combination; not limited to same-env pairs)",
     "service": "Service",
+    "pickHint": "Tick the columns you want to compare, then hit Compare. Matching versions are green, mismatches red.",
     "serviceHint": "= last segment of image name",
     "empty": "No data yet — configure environments on an platform, then collect.",
     "incomplete": "These columns failed to collect and are marked no-data; this result is incomplete: {{cols}}",
@@ -81,7 +82,13 @@
     "staleCols": "These columns failed to refresh and are showing previously collected data: {{cols}}",
     "autoRefresh": "Refresh stale data before comparing",
     "startTitle": "No comparison yet",
-    "startReason": "{{n}} column(s) selected. Click Compare to pull the latest versions and line them up - at least two columns are needed."
+    "startReason": "{{n}} column(s) selected. Click Compare to pull the latest versions and line them up - at least two columns are needed.",
+    "excludedCount": "{{n}} excluded",
+    "excludedHint": "{{n}} services in this column are filtered out by the collection rules (workload excludes / namespace scope) and take no part in the comparison. When the two sides use different rules you will see rows where one side has a version and the other reads “ignored” — that is not a match, it means we never collected this side.",
+    "worstOverlap": "\"{{col}}\" is what turns {{pct}}% of the rows into \"missing\" - its service scope differs greatly from the other columns. Try unchecking it.",
+    "selectAll": "Select all",
+    "clearAll": "Clear",
+    "pickColumnsFirst": "Pick the columns to compare, then hit Compare. Nothing is pre-selected on purpose - only you know which columns matter."
   },
   "org": {
     "title": "Platforms",
@@ -116,9 +123,9 @@
     "clusters": "Clusters",
     "clustersPh": "One per line. Kite: cluster name; Rancher: clusterId (c-m-xxxx)",
     "nsInclude": "ns include",
-    "nsIncludePh": "One per line, prefix like app-* supported. Blank = all namespaces (needs cluster-scope read)",
+    "nsIncludePh": "One per line, prefix like prod-* supported. Blank = all namespaces (needs cluster-level read)",
     "nsExclude": "ns exclude",
-    "nsExcludePh": "Takes precedence over include. app-* also matches app-uat; exclude it here",
+    "nsExcludePh": "Takes precedence over include. prod-* also matches prod-canary; exclude it here",
     "override": "Override",
     "overridePh": "Blank = inherit from platform",
     "overrideHint": "Empty = inherit from platform. Fill in per environment when a customer runs two Ranchers (one for UAT, one for PROD)",
@@ -161,11 +168,19 @@
     "noEnvYet": "No environment yet - this project will not appear in comparisons until you add one",
     "rulesCheck": "Check matches",
     "rulesChecking": "Checking…",
-    "rulesCheckHint": "Runs the rules against the last collected service names. Zero matches almost always means a typo.",
+    "rulesCheckHint": "Matches on workload names (same rule the collector uses); the sample includes services already excluded",
     "rulesNoData": "This environment has never been collected, cannot preview",
     "rulesKept": "kept after rules",
-    "rulesZero": "matches nothing — is that intended?",
-    "rulesNeedRecollect": "Saved. Service / namespace rules apply at collection time — run Collect again for them to take effect"
+    "rulesZero": "0 matches - this rule is new, is it spelled correctly?",
+    "rulesNeedRecollect": "Saved. Service / namespace rules apply at collection time — run Collect again for them to take effect",
+    "rulesZeroActive": "Saved but currently matches nothing - the environment may have changed, or it was wrong from the start",
+    "rulesKeptNote": "Note: the sample is a filtered snapshot; this count excludes services already removed by active rules",
+    "credFromDs": "from datasource",
+    "credEnvLevel": "configured per-env",
+    "credEnvPartial": "configured on some envs",
+    "envDatasource": "Data source",
+    "envDsNone": "None (enter address and credentials here)",
+    "envDsHint": "When a customer runs separate Rancher instances for UAT and PROD, create one data source each and pick them here — credentials live in one place, so a password change does not have to be repeated per environment."
   },
   "user": {
     "title": "Users",
@@ -271,7 +286,7 @@
     "or": "or",
     "showPw": "Show password",
     "hidePw": "Hide password",
-    "pitch": "Compare service versions across companies and environments — see at a glance which ones differ and which exist on only one side.",
+    "pitch": "Compare service versions across platforms and environments — see at a glance which ones differ and which exist on only one side.",
     "feat": {
       "compare": {
         "name": "Compare",
@@ -303,7 +318,9 @@
     "upgrade": "Upgrade",
     "rollback": "Rollback",
     "added": "Added",
-    "removed": "Removed"
+    "removed": "Removed",
+    "suspectRule": "likely a rule change",
+    "suspectRuleHint": "This removal is probably not real: the service is still excluded by a collection rule, meaning we stopped collecting it rather than it going away"
   },
   "notFound": {
     "title": "Page not found",
@@ -369,9 +386,23 @@
     "guide3": "Add a notification channel, otherwise a failed sync goes unnoticed",
     "emptyCompact": "No source Harbor yet. Follow the three steps above and connection status shows here",
     "policyFilter": "Only pull these policies",
-    "policyFilterPh": "One name per line; push-to-* / *-prod / *appA* supported. Empty = pull all",
+    "policyFilterPh": "One name per line; push-to-* / *-prod / *backup* supported. Empty = pull all",
     "policyFilterHint": "A Harbor may hold dozens of policies while only a few matter here. Each policy costs 20 execution fetches per round — not filtering will slow Harbor down",
-    "destOrg": "Pushes to"
+    "destOrg": "Pushes to",
+    "noTag": "Harbor did not record a version",
+    "noTagHint": "When replicating by repository, Harbor only writes \"repo [N item(s) in total]\" without a concrete tag. So we can confirm the service was pushed, but not which version — the comparison shows these as \"sync status unknown\" rather than \"not synced\".",
+    "hookSection": "Harbor webhook",
+    "hookHint": "Polling the Harbor API cannot tell which version was pushed — it only writes \"repo [N item(s) in total]\" for multi-image replications. Webhook events carry the full version, and the sync attribution in the comparison depends on it. Create one under Harbor → Project → Webhooks with event type \"Replication status changed\".",
+    "hookUrlLabel": "Target URL (paste into the Harbor webhook)",
+    "hookUrlNote": "When ops-version and Harbor share a cluster and namespace, the service address is enough. Note: webhooks are per-project — every Harbor project with replication rules needs its own, or its events never arrive.",
+    "hookTokenOnce": "Shown only once — copy it into the Harbor Auth Header now. Only a hash is stored; not even we can retrieve it.",
+    "hookNamePlaceholder": "What it is for, e.g. \"Harbor replication events\"",
+    "hookCreate": "Generate token",
+    "hookNone": "No tokens yet. Requests without one are rejected — this endpoint writes comparison evidence, so no auth would let anyone fake a \"synced\" result.",
+    "hookUsed": "Last called {{at}}",
+    "hookNeverUsed": "Never called",
+    "hookRevoke": "Revoke",
+    "hookLastEvent": "Most recent event received"
   },
   "trigger": {
     "manual": "Manual",
@@ -547,7 +578,7 @@
     "credNone": "No credential",
     "nameRequired": "Name is required",
     "empty": "No data sources yet",
-    "emptyHint": "When several companies share one Rancher/ArgoCD/Kite, configure it once here",
+    "emptyHint": "When several platforms share one Rancher/ArgoCD/Kite, configure it once here",
     "deleteTitle": "Delete data source",
     "deleteConfirm": "Delete data source \"{{name}}\"?",
     "deleteInUse": "{{n}} platform(s) still use it — reassign them first"
@@ -564,7 +595,7 @@
     "noRule": "No rule — all collected services under this platform belong to it",
     "pinnedN": "{{n}} service(s) pinned",
     "include": "Service name rules",
-    "includeHint": "One per line, wildcards supported (biz-*). Leave blank to skip name filtering",
+    "includeHint": "One per line, wildcards supported (e.g. payment-*). Leave blank to skip name filtering",
     "pins": "Pinned services",
     "pinsHint": "Pick services explicitly when names share no pattern. Leave empty to skip.",
     "belongTo": "Project",
@@ -574,6 +605,14 @@
     "pickCount": "{{n}} selected of {{total}} collected"
   },
   "ignore": {
+    "addSection": "Add ignore rule",
+    "addHint": "Ignores the whole row — applied to every column at once, so it cannot create a one-sided gap. Supports * wildcards; paste several at once separated by newlines or commas.",
+    "addPlaceholder": "*-game-frontend\n*-resource-backend",
+    "add": "Add",
+    "added": "Added {{n}} rule(s) — click Compare to apply",
+    "hitSection": "Services actually matched by these rules ({{n}})",
+    "hitHint": "They do not appear in the comparison table but are listed on the exported “Notes” sheet. The rules are the intent; this is the outcome — look here to answer “why is this service missing from the table”.",
+    "manageEmpty": "Ignore rules",
     "rowAction": "Skip this service",
     "cellAction": "Skip this cell",
     "batchAction": "Ignore selected services",
@@ -609,7 +648,7 @@
     "codeLocked": "Role code cannot be changed - users reference it; changing it would strip their permissions",
     "name": "Role name",
     "namePh": "Alert manager",
-    "permsHint": "sync.trigger actually pushes images to the other company's Harbor - that cannot be undone.",
+    "permsHint": "sync.trigger actually pushes images to the other platform's Harbor - that cannot be undone.",
     "deleteTitle": "Delete role",
     "deleteConfirm": "Delete the role {{name}}?",
     "deleteInUse": "{{n}} user(s) still use this role. Move them to another role first."
