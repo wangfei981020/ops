@@ -283,7 +283,7 @@ function DatasourceForm({
         </>
       }
     >
-      {field(t('opsversion:ds.name'), input(f.name, (v) => set('name', v), 'asia-dev-rancher'),
+      {field(t('opsversion:ds.name'), input(f.name, (v) => set('name', v), 'partner-rancher'),
         t('opsversion:ds.nameHint'))}
       <div className="mb-2.5 flex gap-2">
         <Select

@@ -11,7 +11,7 @@ func TestWorkloadNameOfPod(t *testing.T) {
 	cases := []struct{ pod, want string }{
 		// Deployment：<name>-<rs哈希>-<随机5位>
 		{"wallet-backend-7d4f8b9c6d-x2k9p", "wallet-backend"},
-		{"biz-baccarat-h5-c-game-frontend-74cdc4bf6-qs2b6", "biz-baccarat-h5-c-game-frontend"},
+		{"biz-svc-frontend-74cdc4bf6-qs2b6", "biz-svc-frontend"},
 		{"argocd-server-6b569c949c-whjcq", "argocd-server"},
 		// StatefulSet：<name>-<序号>
 		{"mysql-0", "mysql"},

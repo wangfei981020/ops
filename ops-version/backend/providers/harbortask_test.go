@@ -30,8 +30,8 @@ func TestTasksPicksFieldThatActuallyHasTag(t *testing.T) {
 			// 实测过形态：dst 非空但没版本号，src 带版本号
 			name: "dst没版本号_src有",
 			body: `[{"id":1,"status":"Succeed",
-			        "dst_resource":"bizB/baccarat-h5-c-game-frontend [1 item(s) in total]",
-			        "src_resource":"asia-dev/baccarat-h5-c-game-frontend:20260825093501-28"}]`,
+			        "dst_resource":"bizB/svc-frontend [1 item(s) in total]",
+			        "src_resource":"partner/svc-frontend:20260825093501-28"}]`,
 			wantTag: "20260825093501-28",
 		},
 		{
@@ -39,7 +39,7 @@ func TestTasksPicksFieldThatActuallyHasTag(t *testing.T) {
 			name: "dst有版本号",
 			body: `[{"id":1,"status":"Succeed",
 			        "dst_resource":"bizB/svc-a:v9",
-			        "src_resource":"asia-dev/svc-a:v1"}]`,
+			        "src_resource":"partner/svc-a:v1"}]`,
 			wantTag: "v9",
 		},
 		{
@@ -47,8 +47,8 @@ func TestTasksPicksFieldThatActuallyHasTag(t *testing.T) {
 			name: "版本号在resource对象里",
 			body: `[{"id":1,"status":"Succeed",
 			        "dst_resource":"bizB/svc-b [1 item(s) in total]",
-			        "src_resource":"asia-dev/svc-b [1 item(s) in total]",
-			        "resource":{"repository":"asia-dev/svc-b","tag":"20260825-77"}}]`,
+			        "src_resource":"partner/svc-b [1 item(s) in total]",
+			        "resource":{"repository":"partner/svc-b","tag":"20260825-77"}}]`,
 			wantTag: "20260825-77",
 		},
 	}
@@ -80,7 +80,7 @@ func TestTasksPicksFieldThatActuallyHasTag(t *testing.T) {
 func TestTasksMutation_OldLogicWouldFail(t *testing.T) {
 	body := `[{"id":1,"status":"Succeed",
 	           "dst_resource":"bizB/svc [1 item(s) in total]",
-	           "src_resource":"asia-dev/svc:v123"}]`
+	           "src_resource":"partner/svc:v123"}]`
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		_, _ = w.Write([]byte(body))
 	}))

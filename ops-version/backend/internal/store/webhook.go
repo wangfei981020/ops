@@ -175,7 +175,7 @@ func (s *Store) resolvePolicy(ctx context.Context, policyName, destEndpoint, src
 	// ② 源项目 + 目标地址 —— **精确**到具体规则。
 	//
 	// 🔴 这一层才是真正解决问题的：多条规则指向同一个目标 Harbor 时
-	//    （生产上 appA / bizB / monitoring 都推向 asia-dev-harbor），
+	//    （生产上 appA / bizB / monitoring 都推向 partner-harbor），
 	//    光看目标地址必然命中多条，appA 推的镜像会被记成 bizB 推的。
 	//    源项目把它们区分开。
 	if sp := strings.TrimSpace(srcProject); sp != "" && ep != "" {

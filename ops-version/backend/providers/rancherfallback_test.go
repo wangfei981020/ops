@@ -26,7 +26,7 @@ func TestRancherFallsBackToPodsWhenDeploymentsForbidden(t *testing.T) {
 				{"metadata":{"name":"wallet-backend-7d4f8b9c6d-x2k9p","namespace":"app-uat"},
 				 "spec":{"nodeName":"n1"},
 				 "status":{"phase":"Running","podIP":"10.0.0.1","containerStatuses":[
-				   {"name":"app","image":"reg.example.com/asia-dev/wallet-backend:20260819054132-51","ready":true}]}},
+				   {"name":"app","image":"reg.example.com/partner/wallet-backend:20260819054132-51","ready":true}]}},
 				{"metadata":{"name":"mysql-0","namespace":"app-uat"},
 				 "spec":{"nodeName":"n2"},
 				 "status":{"phase":"Running","podIP":"10.0.0.2","containerStatuses":[

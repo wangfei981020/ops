@@ -299,16 +299,23 @@ func (s *Server) Routes() http.Handler {
 	//    现在项目由后端从我方快照的 image_repo 推出来（ProjectOfService），
 	//    服务清单来自复制记录（ServicesOfPolicy）—— 前端不再需要它们。
 	//
-	// ⚠️ providers.Harbor 的 Projects()/Repositories() **保留**：
-	//    checkImages 内部仍用 Repositories 校验服务名是否真的存在
-	//    （Harbor 对不存在的仓库返回 200 + 空数组，不校验就分不清
-	//    「名字打错了」和「这个服务确实没有版本」）。
-	//    删的是**对外的路由**，不是能力。
+	// ⚠️ providers.Harbor 的 Projects()/Repositories() **保留**：能力还在，
+	//    只是没有对外路由了。
+	//
+	// 🔴 /api/images/check（「和我方 Harbor 逐版本比对」）也已删。
+	//
+	//    它做的是：拉我方 Harbor 里该服务最近 N 个 tag，逐个去复制记录里
+	//    查有没有对应的成功任务。名字叫「比对」但比的不是两边 Harbor ——
+	//    我们没有对方的账号，比不了。用户的原话是
+	//    「同步就同步了，怎么还和我方 Harbor 对比呢，本来就是从我们的 Harbor
+	//    同步过去的」「这个对比，也没看到怎么对比的」。
+	//
+	//    真正要回答的问题是「同步过去的是哪个版本」，那由 sync_tasks 直接回答，
+	//    不需要再打一次 Harbor。
 	// 一条复制规则推过哪些服务 —— 「按服务查同步」用它代替「先选项目」
 	mux.HandleFunc("GET /api/sync/policies/{id}/services", s.requires(auth.PermView, s.policyServices))
 	// 某几个服务的推送记录（来自我们自己的库，不打 Harbor）
 	mux.HandleFunc("GET /api/sync/tasks", s.requires(auth.PermView, s.syncTasks))
-	mux.HandleFunc("POST /api/images/check", s.requires(auth.PermView, s.checkImages))
 
 	// MCP：给 AI 用的只读工具集。走独立令牌，不复用浏览器会话
 	mux.HandleFunc("POST /api/mcp", s.mcpHandler)

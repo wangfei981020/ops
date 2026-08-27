@@ -6,6 +6,7 @@ import (
 	"strings"
 	"time"
 
+	"ops-version-backend/logx"
 	"ops-version-backend/providers"
 )
 
@@ -254,8 +255,38 @@ func (s *Store) SaveExecutions(ctx context.Context, policyRef int64, es []provid
 	return changed, nil
 }
 
+// SaveTasks 写入任务明细。
+//
+// 🔴 **没有版本号的一律不落库。**
+//
+//	这张表回答的问题只有一个：「同步过去的是哪个版本」。
+//	tag 为空的记录回答不了它，却会造成两个实打实的后果：
+//
+//	① 唯一键是 (policy_ref, exec_id, service_key, tag) —— tag 也在里面。
+//	   于是空 tag 那条和 webhook 写入的带版本号那条**互不冲突、并排存着**，
+//	   界面上同一个服务、同一个时刻出现两行，一行有版本号一行写着
+//	   「Harbor 未记录版本」，看的人无从判断哪个是真的。
+//
+//	② 采集器每 30 分钟对**所有历史 execution** 全量拉一遍，
+//	   而 Harbor 的 resource 字段只在复制刚结束时有值 ——
+//	   实测这条路径拿回的 task 中位数是 258 天前的，无一例外没有版本号。
+//	   不拦的话，这些废记录会随每轮采集不断累积。
+//
+//	版本号的可靠来源只有 webhook（趁复制刚结束回查 API）。
+//	采集器拿不到版本号时，「执行记录」表里仍然有这次复制的完整记录，
+//	用户不会因此以为"没同步过" —— 少的只是一条答不上话的明细。
+//
+// ⚠️ 与 api/harborhook.go 的 collect() 是**同一个标准**。
+//
+//	原来只有 webhook 那条路径做了这个过滤，采集器这条全盘接收，
+//	同一张表两个入口两套标准 —— 迟早从宽的那条漏进来，而且确实漏了。
 func (s *Store) SaveTasks(ctx context.Context, policyRef, execID int64, ts []providers.SyncTask) error {
+	skipped := 0
 	for _, t := range ts {
+		if strings.TrimSpace(t.Tag) == "" {
+			skipped++
+			continue
+		}
 		if _, err := s.db.ExecContext(ctx, `
 			INSERT INTO sync_tasks (policy_ref, exec_id, service_key, tag, status, err_msg, finished_at)
 			VALUES (?,?,?,?,?,?,?)
@@ -265,6 +296,15 @@ func (s *Store) SaveTasks(ctx context.Context, policyRef, execID int64, ts []pro
 			truncate(t.ErrMsg, 500), nullIfZero(t.FinishedAt)); err != nil {
 			return err
 		}
+	}
+	// 全部被丢弃时要说出来：那意味着这次采集对「按服务查同步」毫无贡献，
+	// 而界面上只会表现为"这条规则没有明细"，不指向任何一层。
+	if skipped > 0 {
+		logx.Info("harborsync", "tasks_without_tag_skipped", map[string]any{
+			"policy_ref": policyRef, "exec_id": execID,
+			"skipped": skipped, "saved": len(ts) - skipped,
+			"note": "Harbor 没给版本号（resource 已过期变 null），不落库。" +
+				"版本号的可靠来源是 webhook，执行记录不受影响"})
 	}
 	return nil
 }

@@ -246,7 +246,7 @@ func (h *Harbor) Policies(ctx context.Context) ([]SyncPolicy, error) {
 		// 🔴 filters 里的 name 过滤是「源项目/仓库」，形如 `appA/**`。
 		//    它是把 webhook 事件精确关联回规则的**唯一**可靠线索：
 		//    payload 里没有规则名，而多条规则常指向同一个目标 Harbor
-		//    （生产上 appA/bizB/monitoring 都推向 asia-dev-harbor），
+		//    （生产上 appA/bizB/monitoring 都推向 partner-harbor），
 		//    只按目标地址匹配会张冠李戴。
 		Filters []struct {
 			Type  string `json:"type"`

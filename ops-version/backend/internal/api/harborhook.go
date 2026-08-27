@@ -19,6 +19,20 @@ import (
 	"ops-version-backend/providers"
 )
 
+// webhookTaskWindow 回查任务明细时，只认这个时间窗内结束的 task。
+//
+// 🔴 Harbor 的 execution 是**长期累积**的：按 execution_id 查任务明细，
+// 拿回来的是这条复制规则历次执行的全部 task，不是"刚刚这一次"。
+//
+// 生产实测（2026-08-26，134 条 task_without_tag 日志）：
+// 查询时刻 − task 结束时刻的中位数是 **258 天**，最大 363 天，
+// 一分钟以内的一条都没有。那些陈年 task 的 resource 字段早已是 null，
+// 于是「趁热去 API 拿版本号」实际拿回一批没有版本号的历史记录。
+//
+// 15 分钟：复制通常在秒级到分钟级完成，webhook 到达时 task 刚结束不久；
+// 留出余量是为了容忍 Harbor 与本服务之间的时钟偏差和推送延迟。
+const webhookTaskWindow = 15 * time.Minute
+
 // harborEvent Harbor webhook 的 REPLICATION 事件。
 //
 // 🔴 只取我们真正要用的字段。Harbor 各版本 payload 会长，
@@ -92,7 +106,7 @@ type harborArtifact struct {
 	// 🔴🔴 **版本号在这里，不在 name_tag。**
 	//
 	//    实测过（2026-08-26 10:07:26 的真实 payload）：
-	//      "name_tag":   "biz-baccarat-h5-c-game-frontend [1 item(s) in total]"   ← 没有版本号
+	//      "name_tag":   "biz-svc-frontend [1 item(s) in total]"   ← 没有版本号
 	//      "references": ["20260826020637-30"]                                    ← 版本号在这
 	//
 	//    name_tag 里 `[N item(s) in total]` 是「这个 artifact 有 N 个 tag」的意思，
@@ -328,7 +342,7 @@ func (s *Server) harborHook(w http.ResponseWriter, r *http.Request) {
 		// 🔴 用 **dest_ns** 当源项目，不是 src_ns。
 		//
 		//    Harbor 复制时目标项目与源项目同名（appA → appA、bizB → bizB），
-		//    而 src_resource.namespace 实测拿到的是 "asia-dev"（源 registry 的名字），
+		//    而 src_resource.namespace 实测拿到的是源 registry 的名字，
 		//    对不上我们存的源项目。dest_ns 才是那个 `bizB`。
 		//    ——这是从生产真实 payload 里看出来的，不是猜的（17:35:48 那条）。
 		srcProject = rep.DestResource.Namespace
@@ -627,14 +641,52 @@ func (s *Server) tasksAtWebhookTime(ctx context.Context, hostname string,
 		return nil
 	}
 	out := make([]store.WebhookSyncTask, 0, len(tasks))
+	stale, noTag := 0, 0
 	for _, t := range tasks {
 		fin := t.FinishedAt
 		if fin.IsZero() {
 			fin = at
 		}
+		// 🔴 只要**这一次**复制刚产生的 task。
+		//
+		//    Harbor 的 execution 是长期累积的：一个 execution 下躺着这条规则
+		//    历次复制的全部 task，按 execution_id 查会把它们**一并**带回来。
+		//    而 `resource` 只在复制刚结束时有值 —— 陈年 task 早就是 null 了。
+		//
+		//    生产实测（2026-08-26 日志 134 条 task_without_tag）：
+		//      查询时刻 − task 结束时刻，中位数 **258 天**，最大 363 天，
+		//      1 分钟以内的**一条都没有**，超过 1 小时的 132/134。
+		//      它们无一例外 resource=null、name_tag=""、name=""。
+		//
+		//    不拦的话，每收到一次 webhook 就往库里灌一批没有版本号的记录，
+		//    界面上表现为「Harbor 未记录版本」——而这张表存在的全部意义
+		//    就是回答「同步过去的是哪个版本」。
+		if at.Sub(fin) > webhookTaskWindow {
+			stale++
+			continue
+		}
+		// 🔴 版本号为空的不落库 —— 与 collect() 保持**同一个标准**。
+		//
+		//    原来 collect()（webhook 自带的 artifact）严格丢弃空版本号，
+		//    而这条 API 回查路径全盘接收，两条路径写进同一张表。
+		//    调用方还是 `if withTag > 0 { rows = apiRows }` —— 整批替换：
+		//    一次复制里只要有一个 task 查到版本号，其余查不到的也跟着落库。
+		//
+		// ⚠️ 同一份数据的两条入口用不同的过滤标准，迟早会从宽的那条漏进来。
+		if strings.TrimSpace(t.Tag) == "" {
+			noTag++
+			continue
+		}
 		out = append(out, store.WebhookSyncTask{
 			ServiceKey: t.ServiceKey, Tag: t.Tag, Status: t.Status, FinishedAt: fin,
 		})
+	}
+	if stale > 0 || noTag > 0 {
+		logx.Info("webhook", "api_tasks_filtered", map[string]any{
+			"exec_id": execID, "kept": len(out), "stale": stale, "no_tag": noTag,
+			"window": webhookTaskWindow.String(),
+			"note": "stale=不属于本次复制的历史 task；no_tag=Harbor 没给版本号。" +
+				"两者都不落库：没有版本号的记录回答不了「推的是哪个版本」"})
 	}
 	return out
 }

@@ -13,7 +13,7 @@
 -- 现在要把地址和凭据重复配 N 遍 —— 改一次密码要改 N 处，漏一处就是一个平台悄悄采集失败。
 CREATE TABLE IF NOT EXISTS datasources (
   id            BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
-  name          VARCHAR(64)  NOT NULL COMMENT '给人看的名字，如 asia-dev-rancher',
+  name          VARCHAR(64)  NOT NULL COMMENT '给人看的名字，如 partner-rancher',
   provider_type VARCHAR(32)  NOT NULL COMMENT 'kite | rancher | argocd',
   endpoint      VARCHAR(255) NOT NULL DEFAULT '',
   auth_type     VARCHAR(32)  NOT NULL DEFAULT '' COMMENT 'password | api_key | token',
