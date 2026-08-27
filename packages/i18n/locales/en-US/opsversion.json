@@ -480,7 +480,8 @@
     "colTag": "Version",
     "colTo": "Pushed to",
     "colState": "Result",
-    "colWhen": "When"
+    "colWhen": "When",
+    "unboundHidden": "{{n}} more rule(s) not bound to a platform are hidden — bind them under Image Sync → Settings"
   },
   "authType": {
     "password": "Username & password",

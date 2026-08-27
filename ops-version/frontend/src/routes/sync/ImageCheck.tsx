@@ -53,6 +53,17 @@ export function ImageCheck() {
     [services.data],
   )
 
+  // 🔴 只列**已绑定平台**的规则。
+  //
+  //    没绑定的规则答不了这个页面的问题 —— 「推给谁」那一列会是空的，
+  //    而这个页面回答的正是「某个版本推给某方了没有」。
+  //    把它们摆在下拉里，选中之后只会得到一屏没有接收方的记录。
+  //
+  // ⚠️ 不是静默丢弃：下面会说清"有几条没绑定、去哪绑"，
+  //    否则人会以为规则丢了，或者对着少掉的选项猜。
+  const bound = useMemo(() => (policies.data ?? []).filter((p) => p.org_name), [policies.data])
+  const unboundCount = (policies.data ?? []).length - bound.length
+
   async function run() {
     setErr('')
     if (picked.length === 0) {
@@ -104,12 +115,18 @@ export function ImageCheck() {
           }}
           options={[
             { value: '', label: t('opsversion:imgcheck.anyPolicy') },
-            ...(policies.data ?? []).map((p) => ({
+            ...bound.map((p) => ({
               value: String(p.id),
-              label: p.org_name ? `${p.name} → ${p.org_name}` : `${p.name}（未绑定）`,
+              label: `${p.name} → ${p.org_name}`,
             })),
           ]}
         />
+        {/* ⚠️ 少掉的选项要交代去向，否则人会以为规则丢了 */}
+        {unboundCount > 0 && (
+          <span className="text-[11px] text-muted-foreground">
+            {t('opsversion:imgcheck.unboundHidden', { n: unboundCount })}
+          </span>
+        )}
         <MultiSelect
           label={t('opsversion:imgcheck.services')}
           value={picked}

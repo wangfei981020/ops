@@ -480,7 +480,8 @@
     "colTag": "版本",
     "colTo": "推给谁",
     "colState": "结果",
-    "colWhen": "时间"
+    "colWhen": "时间",
+    "unboundHidden": "另有 {{n}} 条规则未绑定平台，未列出 —— 到「镜像同步 → 设置」里绑定后即可查"
   },
   "authType": {
     "password": "用户名密码",

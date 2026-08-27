@@ -3,6 +3,7 @@ package store
 import (
 	"context"
 	"strings"
+	"time"
 )
 
 // SyncTaskRow 一次「把某个版本推给某方」的记录。
@@ -13,7 +14,22 @@ type SyncTaskRow struct {
 	Tag        string `json:"tag"`
 	Status     string `json:"status"`
 	ErrMsg     string `json:"err_msg"`
-	FinishedAt string `json:"finished_at"`
+	// FinishedAt 这次推送完成的时刻。
+	//
+	// 🔴 用 *time.Time，**不要在 SQL 里自己拼时区标记**。
+	//
+	//	原来是 `DATE_FORMAT(t.finished_at, '%Y-%m-%dT%H:%i:%sZ')` ——
+	//	末尾那个 Z 是**硬编码**的。而列里存的是本地时区的墙钟值，
+	//	于是「北京时间 09:49」被贴上 UTC 标签发给前端，
+	//	`new Date()` 照 UTC 解析再转回本地，界面显示成 **17:49**。
+	//	整整差一个时区，而**数据本身是对的**，错的只有那一个字母。
+	//
+	//	生产实测（2026-08-27）：Harbor 界面 09:49，本站显示 17:49。
+	//
+	// ⚠️ 交给驱动（按 DSN 里钉住的会话时区解析）和 encoding/json
+	//	（序列化成带偏移的 RFC3339）—— 它们用的是同一套基准，
+	//	不会像手写字符串那样各说各话。
+	FinishedAt *time.Time `json:"finished_at"`
 }
 
 // SyncTasksOf 查某几个服务的推送记录。
@@ -28,8 +44,7 @@ type SyncTaskRow struct {
 // policyRef=0 = 不限规则。services 为空 = 不限服务（调用方负责别一次要太多）。
 func (s *Store) SyncTasksOf(ctx context.Context, policyRef int64, services []string, limit int) ([]SyncTaskRow, error) {
 	q := `SELECT p.name, COALESCE(o.name,''), t.service_key, t.tag, t.status,
-	             COALESCE(t.err_msg,''),
-	             COALESCE(DATE_FORMAT(t.finished_at, '%Y-%m-%dT%H:%i:%sZ'), '')
+	             COALESCE(t.err_msg,''), t.finished_at
 	        FROM sync_tasks t
 	        JOIN sync_policies p ON p.id = t.policy_ref
 	        LEFT JOIN orgs o ON o.id = p.org_id

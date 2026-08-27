@@ -105,7 +105,8 @@ export interface PolicyService {
   service_key: string
   /** 推过多少个版本 */
   tags: number
-  last_at: string
+  /** 最近一次推它的时刻（RFC3339，**带时区偏移**）；没推过时为 null */
+  last_at: string | null
   /** 其中失败了多少次 —— 非零时这个服务要优先看 */
   failed: number
 }
@@ -118,5 +119,12 @@ export interface SyncTaskRow {
   tag: string
   status: string
   err_msg: string
-  finished_at: string
+  /**
+   * 推送完成时刻（RFC3339，**带时区偏移**）；未完成时为 null。
+   *
+   * ⚠️ 后端一度用 `DATE_FORMAT(..., '...Z')` 手拼这个串，把本地时间
+   * 贴上 UTC 标签，`new Date()` 再按 UTC 转一次，界面整整差 8 小时。
+   * 现在由后端序列化 time.Time 产出，偏移是真的，直接 new Date 即可。
+   */
+  finished_at: string | null
 }

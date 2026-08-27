@@ -1,14 +1,21 @@
 package store
 
-import "context"
+import (
+	"context"
+	"time"
+)
 
 // PolicyService 某条复制规则推过的一个服务。
 type PolicyService struct {
 	ServiceKey string `json:"service_key"`
 	// Tags 这条规则推过这个服务的多少个版本
 	Tags int `json:"tags"`
-	// LastAt 最近一次推它是什么时候（RFC3339 字符串，可能为空）
-	LastAt string `json:"last_at"`
+	// LastAt 最近一次推它是什么时候（没推过时为 null）。
+	//
+	// ⚠️ 与 SyncTaskRow.FinishedAt 同一个坑：**别在 SQL 里手拼时区标记**。
+	//	`DATE_FORMAT(..., '%Y-%m-%dT%H:%i:%sZ')` 会把本地时间贴上 UTC 标签，
+	//	前端再按 UTC 转一次，界面上整整差一个时区。
+	LastAt *time.Time `json:"last_at"`
 	// Failed 这些推送里有多少是失败的 —— 非零时这个服务要优先看
 	Failed int `json:"failed"`
 }
@@ -26,8 +33,7 @@ type PolicyService struct {
 //
 // policyRef=0 = 不限规则（所有规则推过的服务的并集）。
 func (s *Store) ServicesOfPolicy(ctx context.Context, policyRef int64) ([]PolicyService, error) {
-	q := `SELECT t.service_key, COUNT(DISTINCT t.tag), 
-	             COALESCE(DATE_FORMAT(MAX(t.finished_at), '%Y-%m-%dT%H:%i:%sZ'), ''),
+	q := `SELECT t.service_key, COUNT(DISTINCT t.tag), MAX(t.finished_at),
 	             SUM(CASE WHEN t.status NOT IN ('Succeed','Succeeded') THEN 1 ELSE 0 END)
 	        FROM sync_tasks t`
 	args := []any{}
