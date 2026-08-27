@@ -209,8 +209,34 @@ export function ReconPage({ session }: { session: Session }) {
     },
   })
 
+  /**
+   * 丢掉上一次的比对结果。
+   *
+   * 🔴 **任何改变「查什么」的操作都必须调它。**
+   *
+   *    结果是一次请求的快照，它只对**产生它的那组输入**成立。
+   *    换了方案、改了列、改了筛选之后还把它留在屏幕上，
+   *    看的人没有任何线索知道这张表已经不对应当前选择了 ——
+   *    界面上一切正常，数字也都在，只是答的是上一个问题。
+   *
+   *    生产实测（2026-08-27）：出结果后切换方案，表格纹丝不动，
+   *    要点开别的页面再刷新才会变。用户当场把旧数据看成了新方案的对账结果。
+   *
+   * ⚠️ 派生状态要一起清：勾选、判定筛选、关键词、钻取弹窗
+   *    全都指向已经不存在的行 —— 留着它们比留着结果更难察觉。
+   */
+  function invalidateResult() {
+    setResult(null)
+    setChecked(new Set())
+    setVerdictPick(null)
+    setKeyword('')
+    setDrill(null)
+  }
+
   function applyPlan(id: string) {
     setPlanId(id)
+    // 换方案 = 换了一组列和忽略规则，上一次的结果立刻失效
+    invalidateResult()
     const p = plans.data?.find((x) => String(x.id) === id)
     if (!p) return
     // 🔴 老方案存的 JSON 里没有 project_id，解出来是 undefined。
@@ -653,13 +679,19 @@ export function ReconPage({ session }: { session: Session }) {
                 <input
                   type="checkbox"
                   checked={onlyDiff}
-                  onChange={(e) => setOnlyDiff(e.target.checked)}
+                  onChange={(e) => {
+                    setOnlyDiff(e.target.checked)
+                    invalidateResult()
+                  }}
                 />
                 {t('opsversion:recon.onlyDiff')}
               </label>
               <input
                 value={svcFilter}
-                onChange={(e) => setSvcFilter(e.target.value)}
+                onChange={(e) => {
+                  setSvcFilter(e.target.value)
+                  invalidateResult()
+                }}
                 placeholder={t('opsversion:recon.servicePh')}
                 title={t('opsversion:recon.serviceHelp')}
                 className="w-60 rounded-md border border-border bg-background px-2 py-1 text-xs text-foreground"
@@ -733,7 +765,10 @@ export function ReconPage({ session }: { session: Session }) {
                 {/* 默认一列都不选，给个一键全选省得逐个点 */}
                 <button
                   type="button"
-                  onClick={() => setPicked(new Set(choices.map(colKey)))}
+                  onClick={() => {
+                    setPicked(new Set(choices.map(colKey)))
+                    invalidateResult()
+                  }}
                   className="text-[11px] text-brand hover:underline"
                 >
                   {t('opsversion:recon.selectAll')}
@@ -741,7 +776,10 @@ export function ReconPage({ session }: { session: Session }) {
                 {selected.size > 0 && (
                   <button
                     type="button"
-                    onClick={() => setPicked(new Set())}
+                    onClick={() => {
+                      setPicked(new Set())
+                      invalidateResult()
+                    }}
                     className="text-[11px] text-muted-foreground hover:underline"
                   >
                     {t('opsversion:recon.clearAll')}
@@ -760,6 +798,7 @@ export function ReconPage({ session }: { session: Session }) {
                           const next = new Set(selected)
                           e.target.checked ? next.add(k) : next.delete(k)
                           setPicked(next)
+                          invalidateResult()
                         }}
                       />
                       {colLabel(c)}
