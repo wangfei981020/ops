@@ -104,22 +104,63 @@ type NotifyRecord struct {
 	At       time.Time `json:"created_at"`
 }
 
-func (s *Store) SaveNotifyRecord(ctx context.Context, channelID int64, execRef int64,
-	level, trigger, state, reason, errMsg, content string, attempts int,
-) error {
-	var ch, ex any
-	if channelID > 0 {
-		ch = channelID
+// NotifyRecordInput 一条投递记录要写进去的东西。
+//
+// ⚠️ 用结构体而不是一串位置参数：原来是 9 个位置参数、其中 5 个是 string，
+// `reason` 和 `errMsg` 挨着、`state` 和 `level` 挨着，写反了编译照过。
+type NotifyRecordInput struct {
+	ChannelID int64 // 0 = 没走到任何渠道（判定不发 / 一个渠道都没配）
+	ExecRef   int64 // sync_executions.id；webhook 路径到达时那一行还不存在，传 0
+	// PolicyRef + HarborExecID 是**去重键**：webhook 实时发过的那次 execution，
+	// 采集器轮询到时不再发。见 029 迁移。
+	PolicyRef    int64
+	HarborExecID int64
+	Level        string // ok | failed
+	Trigger      string
+	State        string // sent | skipped | failed
+	Reason       string
+	ErrMsg       string
+	Content      string
+	Attempts     int
+}
+
+func (s *Store) SaveNotifyRecord(ctx context.Context, in NotifyRecordInput) error {
+	var ch, ex, pol any
+	if in.ChannelID > 0 {
+		ch = in.ChannelID
 	}
-	if execRef > 0 {
-		ex = execRef
+	if in.ExecRef > 0 {
+		ex = in.ExecRef
+	}
+	if in.PolicyRef > 0 {
+		pol = in.PolicyRef
 	}
 	_, err := s.db.ExecContext(ctx, `
-		INSERT INTO notify_records (channel_id, exec_ref, level, trigger_type, state,
-		  reason, err_msg, attempts, content)
-		VALUES (?,?,?,?,?,?,?,?,?)`,
-		ch, ex, level, trigger, state, truncate(reason, 255), truncate(errMsg, 500), attempts, content)
+		INSERT INTO notify_records (channel_id, exec_ref, policy_ref, harbor_exec_id,
+		  level, trigger_type, state, reason, err_msg, attempts, content)
+		VALUES (?,?,?,?,?,?,?,?,?,?,?)`,
+		ch, ex, pol, in.HarborExecID, in.Level, in.Trigger, in.State,
+		truncate(in.Reason, 255), truncate(in.ErrMsg, 500), in.Attempts, in.Content)
 	return err
+}
+
+// AlreadyNotified 这条规则的这次 execution 是不是已经成功通知过了。
+//
+// 🔴 只认 state='sent'。skipped（判定不该发）和 failed（该发没发出去）都不算 ——
+// 把 failed 也当"已通知"的话，webhook 投递失败之后采集器就不会补发了，
+// 而"webhook 发失败"恰恰是采集器这条兜底路径存在的理由。
+//
+// ⚠️ execID=0（拿不到 Harbor 的 execution id）时一律返回 false：
+// 0 不是一个真实的 execution，拿它当键会把所有拿不到 id 的通知**互相**去重掉。
+func (s *Store) AlreadyNotified(ctx context.Context, policyRef, execID int64) (bool, error) {
+	if policyRef <= 0 || execID <= 0 {
+		return false, nil
+	}
+	var n int
+	err := s.db.QueryRowContext(ctx, `
+		SELECT COUNT(*) FROM notify_records
+		 WHERE policy_ref=? AND harbor_exec_id=? AND state='sent'`, policyRef, execID).Scan(&n)
+	return n > 0, err
 }
 
 func (s *Store) ListNotifyRecords(ctx context.Context, limit int) ([]NotifyRecord, error) {

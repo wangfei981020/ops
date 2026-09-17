@@ -57,10 +57,27 @@ func SendFeishu(webhook, text string) error {
 		//	而不是让这里假装成功。
 		return fmt.Errorf("没有配置飞书 webhook，消息未发送")
 	}
-	body, _ := json.Marshal(map[string]any{
+	return post(webhook, map[string]any{
 		"msg_type": "text",
 		"content":  map[string]string{"text": text},
 	})
+}
+
+// SendFeishuCard 发飞书交互卡片（彩色标题栏 + 分区内容）。
+//
+// ⚠️ 与 SendFeishu 走**同一个 post**，因为那套"HTTP 200 也可能是失败"的判定
+// 对卡片一样适用 —— 单独写一份的话，迟早只修其中一份。
+//
+// payload 由 notify.Card 构造，这里只负责投递。
+func SendFeishuCard(webhook string, card map[string]any) error {
+	if webhook == "" {
+		return fmt.Errorf("没有配置飞书 webhook，消息未发送")
+	}
+	return post(webhook, card)
+}
+
+func post(webhook string, payload any) error {
+	body, _ := json.Marshal(payload)
 	resp, err := client.Post(webhook, "application/json", bytes.NewReader(body))
 	if err != nil {
 		return err

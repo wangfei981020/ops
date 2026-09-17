@@ -120,6 +120,12 @@ func (s *Store) MarkHarborSync(ctx context.Context, id int64, status, errMsg str
 //
 // ⚠️ 用 upsert 而不是先删后插：policy 上绑着 org_id（人工配的「这条规则推给哪个组织」），
 // 删了重插会把这个绑定丢掉，表现为「配好的归因过一会儿自己没了」。
+// SavePolicies 把 Harbor 上的复制规则同步进本站。
+//
+// 🔴 **人工设置的列一律不出现在 ON DUPLICATE KEY UPDATE 里**：
+// `org_id`（绑给哪个平台）、`notify_enabled`（要不要发通知）都是人在界面上设的，
+// 写进去的话每轮采集（最多 30 分钟）会把人的设置静默重置回默认值 ——
+// 不报错、日志里也看不出来，表现是"我明明勾过通知，过一会儿又没了"。
 func (s *Store) SavePolicies(ctx context.Context, harborID int64, ps []providers.SyncPolicy) error {
 	for _, p := range ps {
 		if _, err := s.db.ExecContext(ctx, `
@@ -147,38 +153,72 @@ type PolicyRow struct {
 	OrgName      string `json:"org_name"`
 	Trigger      string `json:"trigger_type"`
 	Enabled      bool   `json:"enabled"`
+	// NotifyEnabled 这条规则要不要发通知。开=成功与失败都发，关=一条都不发。
+	//
+	// 🔴 与 Enabled 不是一回事：Enabled 是**这条规则在 Harbor 里**启没启用，
+	// 由采集器从 Harbor 覆盖写回；NotifyEnabled 是人在本站勾的，采集器不得覆盖。
+	NotifyEnabled bool `json:"notify_enabled"`
 }
 
-func (s *Store) ListPolicies(ctx context.Context) ([]PolicyRow, error) {
-	rows, err := s.db.QueryContext(ctx, `
+const policySelect = `
 		SELECT p.id, p.harbor_id, h.name, p.policy_id, p.name, p.dest_registry,
-		       p.org_id, COALESCE(o.name,''), p.trigger_type, p.enabled
+		       p.org_id, COALESCE(o.name,''), p.trigger_type, p.enabled, p.notify_enabled
 		  FROM sync_policies p
 		  JOIN harbors h ON h.id = p.harbor_id
 		  LEFT JOIN orgs o ON o.id = p.org_id
-		 WHERE h.deleted_at IS NULL
-		 ORDER BY p.id`)
+		 WHERE h.deleted_at IS NULL`
+
+func scanPolicy(sc interface{ Scan(...any) error }) (PolicyRow, error) {
+	var p PolicyRow
+	var org sql.NullInt64
+	var en, notify int
+	if err := sc.Scan(&p.Ref, &p.HarborID, &p.HarborName, &p.PolicyID, &p.Name,
+		&p.DestRegistry, &org, &p.OrgName, &p.Trigger, &en, &notify); err != nil {
+		return p, err
+	}
+	if org.Valid {
+		v := org.Int64
+		p.OrgID = &v
+	}
+	p.Enabled = en == 1
+	p.NotifyEnabled = notify == 1
+	return p, nil
+}
+
+func (s *Store) ListPolicies(ctx context.Context) ([]PolicyRow, error) {
+	rows, err := s.db.QueryContext(ctx, policySelect+` ORDER BY p.id`)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
 	out := []PolicyRow{}
 	for rows.Next() {
-		var p PolicyRow
-		var org sql.NullInt64
-		var en int
-		if err := rows.Scan(&p.Ref, &p.HarborID, &p.HarborName, &p.PolicyID, &p.Name,
-			&p.DestRegistry, &org, &p.OrgName, &p.Trigger, &en); err != nil {
+		p, err := scanPolicy(rows)
+		if err != nil {
 			return nil, err
 		}
-		if org.Valid {
-			v := org.Int64
-			p.OrgID = &v
-		}
-		p.Enabled = en == 1
 		out = append(out, p)
 	}
 	return out, rows.Err()
+}
+
+// PolicyByRef 取单条规则。
+//
+// 🔴 通知路径需要的一切（规则名、推给哪个平台、目标地址、通知开关）都在这一行里。
+// 原来采集器是调 ListPolicies 再遍历找 —— 每条 execution 找一次，
+// 规则多了就是一轮采集几十次全表查询，而且拿不到通知开关。
+func (s *Store) PolicyByRef(ctx context.Context, ref int64) (PolicyRow, error) {
+	return scanPolicy(s.db.QueryRowContext(ctx, policySelect+` AND p.id=?`, ref))
+}
+
+// SetPolicyNotify 开/关这条规则的通知。
+//
+// ⚠️ 只动 notify_enabled 一列 —— 这一列是人设的，其余列由采集器从 Harbor 同步，
+// 一起写会把刚拉回来的 Harbor 状态覆盖成界面上的旧值。
+func (s *Store) SetPolicyNotify(ctx context.Context, ref int64, on bool) error {
+	_, err := s.db.ExecContext(ctx,
+		`UPDATE sync_policies SET notify_enabled=? WHERE id=?`, boolToInt(on), ref)
+	return err
 }
 
 // BindPolicyOrg 把复制规则绑到组织。绑了才能把同步状态并进那一列的对账结果。

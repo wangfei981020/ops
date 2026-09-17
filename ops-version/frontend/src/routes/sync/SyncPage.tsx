@@ -10,6 +10,7 @@ import {
   Dialog,
   EmptyState,
   Select,
+  Switch,
   TableSkeleton,
   fromQuery,
   Toast,
@@ -271,6 +272,43 @@ export function SyncPage({ session }: { session: Session }) {
           )}
         </div>
       ),
+    },
+    {
+      id: 'notify',
+      // 🔴 通知是**白名单**：只有在这里打开的规则才会发消息，而且成功失败都发。
+      //
+      //    原来发不发由后端按「触发方式 + 成败」推断（自动成功不发、手动成功发、
+      //    失败一律发）。那套规则两头不讨好：别人手动点一次同步就推给你，
+      //    而你自己关心的自动同步反倒不发。现在改成人来选。
+      //
+      // ⚠️ 关掉的规则**连失败都不发** —— 这是刻意的取舍，提示文案里要说清楚，
+      //    否则半年后有人看到"同步失败了却没告警"会当成 bug 查。
+      header: t('opsversion:sync.notify'),
+      accessorFn: (r) => r.notify_enabled,
+      cell: ({ row }) =>
+        can(session, 'alert.write') ? (
+          <Switch
+            checked={row.original.notify_enabled}
+            label={t('opsversion:sync.notifyOn')}
+            onChange={async (v) => {
+              try {
+                await api(`/api/sync/policies/${row.original.id}/notify`, {
+                  method: 'PUT',
+                  body: JSON.stringify({ enabled: v }),
+                })
+                policies.refetch()
+              } catch (e) {
+                setMsg({ text: (e as Error).message, kind: 'err' })
+              }
+            }}
+          />
+        ) : (
+          <Badge tone={row.original.notify_enabled ? 'ok' : 'mute'}>
+            {row.original.notify_enabled
+              ? t('opsversion:sync.notifyOn')
+              : t('opsversion:sync.notifyOff')}
+          </Badge>
+        ),
     },
   ]
 
@@ -541,7 +579,7 @@ export function SyncPage({ session }: { session: Session }) {
             </div>
             <AsyncBoundary
               state={fromQuery(policies, (d) => d.length === 0, (e) => toLoadError(e, t))}
-              pending={<TableSkeleton columns={[40, 20, 40]} rows={2} />}
+              pending={<TableSkeleton columns={[35, 15, 30, 20]} rows={2} />}
               empty={
                 <div className="rounded-md border border-dashed border-border-strong px-3 py-2.5 text-[11px] text-muted-foreground">
                   {t('opsversion:sync.noPoliciesHint')}
@@ -552,12 +590,23 @@ export function SyncPage({ session }: { session: Session }) {
               onRetry={() => policies.refetch()}
             >
               {(data) => (
-                <DataTable
-                  columns={policyCols}
-                  data={data}
-                  rowKey={(r) => String(r.id)}
-                  minWidth={640}
-                />
+                <>
+                  {/* 🔴 一条规则都没开通知时必须显眼地说出来。
+                      默认是全关的，而"全关"和"坏了"在群里的表现一模一样：
+                      都是一条消息都没有。不写这句的话，下次同步失败没人收到，
+                      第一反应会是去查通知渠道配置，而不是来这里勾一下。 */}
+                  {data.every((p) => !p.notify_enabled) && (
+                    <Banner tone="warn" className="mb-2">
+                      {t('opsversion:sync.noNotifyHint')}
+                    </Banner>
+                  )}
+                  <DataTable
+                    columns={policyCols}
+                    data={data}
+                    rowKey={(r) => String(r.id)}
+                    minWidth={760}
+                  />
+                </>
               )}
             </AsyncBoundary>
           </div>

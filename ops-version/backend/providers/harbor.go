@@ -353,6 +353,36 @@ func (h *Harbor) Executions(ctx context.Context, policyID int64, pageSize int) (
 	return out, nil
 }
 
+// Execution 查单条执行记录。
+//
+// 🔴 通知里那行「耗时」只能从这里来：webhook 的 payload 里**没有**开始/结束时间，
+// 而老的 harbor-replication 脚本也是收到事件后回查这个接口算出来的。
+// 顺带把 trigger 和成功/失败数一并带回 —— webhook 的 artifact 数组只数得出
+// 这一次推了几个，数不出这条 execution 总共几个。
+//
+// ⚠️ 拿不到就返回 error，调用方**不显示耗时那一行**，不要拿零值当 0 秒。
+func (h *Harbor) Execution(ctx context.Context, execID int64) (SyncExecution, error) {
+	var e struct {
+		ID        int64  `json:"id"`
+		Status    string `json:"status"`
+		Trigger   string `json:"trigger"`
+		Total     int    `json:"total"`
+		Succeed   int    `json:"succeed"`
+		Failed    int    `json:"failed"`
+		StartTime string `json:"start_time"`
+		EndTime   string `json:"end_time"`
+	}
+	path := fmt.Sprintf("/api/v2.0/replication/executions/%d", execID)
+	if err := h.get(ctx, path, &e); err != nil {
+		return SyncExecution{}, err
+	}
+	return SyncExecution{
+		ExecID: e.ID, Status: e.Status, TriggerType: NormalizeTrigger(e.Trigger),
+		Total: e.Total, Succeeded: e.Succeed, Failed: e.Failed,
+		StartedAt: parseHarborTime(e.StartTime), EndedAt: parseHarborTime(e.EndTime),
+	}, nil
+}
+
 // SyncTask 单个镜像的同步结果。
 type SyncTask struct {
 	ServiceKey string

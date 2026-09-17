@@ -28,7 +28,15 @@ export interface Policy {
   org_id: number | null
   org_name: string
   trigger_type: string
+  /** 这条规则在 Harbor 里启没启用（由采集器同步回来，不是我们设的） */
   enabled: boolean
+  /**
+   * 要不要为这条规则发通知。开 = 成功与失败都发，关 = 一条都不发。
+   *
+   * 🔴 与 `enabled` 不是一回事：那个说的是 Harbor 那边的状态，
+   * 这个是人在本站勾的白名单，采集器不会覆盖。
+   */
+  notify_enabled: boolean
 }
 
 /** 执行记录的一页 */

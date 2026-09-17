@@ -2,65 +2,54 @@ package notify
 
 import "testing"
 
-// 🔴 失败一律发 —— 这是通知存在的意义
-func TestFailedAlwaysNotifies(t *testing.T) {
+/*
+🔴 关掉通知的规则，**连失败都不发**。
+
+这是整套通知里唯一一处会主动丢掉失败信号的地方，也最容易被后来的人
+"好心"改回去（"失败总该发一条吧"）。用户 2026-09-17 明确要的就是这个语义：
+通知与否只看规则开关，白名单之外一条都不要。
+
+要改这条之前先去问人，别改测试。
+*/
+func TestDisabledPolicyStaysSilentEvenOnFailure(t *testing.T) {
 	for _, trig := range []string{"manual", "event_based", "scheduled", "", "某种没见过的写法"} {
-		for _, st := range []string{"Failed", "failure", "Error", "Stopped"} {
-			d := ShouldNotify(trig, st, false)
-			if !d.Send {
-				t.Errorf("trigger=%q status=%q 失败必须通知，实得不发（%s）", trig, st, d.Reason)
-			}
-		}
-	}
-}
-
-// 手动触发且成功要发：人刚点了按钮，正等着结果
-func TestManualSuccessNotifies(t *testing.T) {
-	d := ShouldNotify("manual", "Succeeded", false)
-	if !d.Send {
-		t.Errorf("手动成功应通知，实得不发：%s", d.Reason)
-	}
-}
-
-// 🔴 自动触发且成功**不发** —— 一天几十次全发出来，
-// 结果是群被设成免打扰，然后真正的失败也没人看见。
-// 这条规则是在保护失败通知的可见性。
-func TestAutoSuccessStaysQuiet(t *testing.T) {
-	for _, trig := range []string{"event_based", "event-based", "scheduled", "cron", "schedule"} {
-		d := ShouldNotify(trig, "Succeeded", false)
+		d := ShouldNotify(false, trig)
 		if d.Send {
-			t.Errorf("trigger=%q 自动成功不该通知，实得发送（%s）", trig, d.Reason)
+			t.Errorf("trigger=%q 规则没开通知就一条都不该发，实得发送（%s）", trig, d.Reason)
+		}
+		if d.Reason == "" {
+			t.Errorf("trigger=%q 不发也要写明原因，否则「这次怎么没通知我」答不上来", trig)
 		}
 	}
 }
 
-// 我们这边有人点了「立即拉取」，即使规则本身是自动的也回一条
-func TestManualRunOverridesQuiet(t *testing.T) {
-	d := ShouldNotify("scheduled", "Succeeded", true)
-	if !d.Send {
-		t.Errorf("人工发起的拉取应回一条，实得不发：%s", d.Reason)
+// 开了通知的规则：成功也发。
+//
+// 🔴 原来「自动触发且成功」是不发的，那套分级已经被规则白名单取代 ——
+// 防刷屏由「只勾几条规则」承担，不再靠少发。
+func TestEnabledPolicyNotifiesOnEveryTrigger(t *testing.T) {
+	for _, trig := range []string{"manual", "event_based", "event-based", "scheduled", "cron", "schedule"} {
+		d := ShouldNotify(true, trig)
+		if !d.Send {
+			t.Errorf("trigger=%q 规则开了通知就该发，实得不发（%s）", trig, d.Reason)
+		}
 	}
 }
 
 /*
-🔴 最重要的一条：触发方式**认不出时要发，并且记 WARN**。
+触发方式**认不出时照发，并且记 WARN**。
 
-Harbor 各版本的拼法不统一，认不出时有两个选择：
-
-	当成自动 → 静默丢弃。万一它其实是手动的，人永远等不到回音，
-	          而且没有任何痕迹能让人发现规则漏了一种拼法。
-	当成要发 → 多几条消息，但那条 WARN 会告诉我们「出现了没见过的取值」。
-
-多发一条被吐槽，漏发一条没人知道 —— 所以选后者。
+Harbor 各版本拼法不统一。认不出不该影响发不发（那是规则开关的事），
+但必须留痕：否则文案里那行「触发方式」会一直显示「未识别」而没人知道要补哪种拼法。
 */
-func TestUnknownTriggerNotifiesAndWarns(t *testing.T) {
+func TestUnknownTriggerStillNotifiesAndWarns(t *testing.T) {
 	for _, trig := range []string{"", "EVENT_BASED_V2", "手动", "unknown-thing"} {
-		d := ShouldNotify(trig, "Succeeded", false)
+		d := ShouldNotify(true, trig)
 		if !d.Send {
-			t.Errorf("trigger=%q 认不出时必须发，实得静默丢弃", trig)
+			t.Errorf("trigger=%q 认不出不该影响发不发", trig)
 		}
 		if !d.Warn {
-			t.Errorf("trigger=%q 认不出时必须记 WARN，否则永远发现不了规则漏了一种拼法", trig)
+			t.Errorf("trigger=%q 认不出必须记 WARN，否则永远发现不了漏了一种拼法", trig)
 		}
 		t.Logf("  %-16q → %s", trig, d.Reason)
 	}
@@ -69,35 +58,28 @@ func TestUnknownTriggerNotifiesAndWarns(t *testing.T) {
 // 已知取值不该误报 WARN，否则日志里全是狼来了
 func TestKnownTriggersDoNotWarn(t *testing.T) {
 	for _, trig := range []string{"manual", "event_based", "event-based", "scheduled", "cron"} {
-		if d := ShouldNotify(trig, "Succeeded", false); d.Warn {
+		if d := ShouldNotify(true, trig); d.Warn {
 			t.Errorf("trigger=%q 是已知取值，不该记 WARN", trig)
 		}
 	}
 }
 
-// 🔴 文案必须写明是手动还是自动：收到的人第一反应是
-// 「这是我刚才点的那次吗」，不写他得去界面比时间戳
-func TestTextSaysTrigger(t *testing.T) {
-	got := Text(LevelFailed, "A平台", "推给A平台", "manual", 10, 8, 2, "wallet:t-114 推送被拒")
-	for _, want := range []string{"手动", "A平台", "推给A平台", "失败 2", "wallet:t-114"} {
-		if !contains(got, want) {
-			t.Errorf("文案缺少 %q：\n%s", want, got)
-		}
-	}
-	// 认不出的取值要把原值带出来，好让人知道该补哪种拼法
-	got2 := Text(LevelOK, "", "x", "WEIRD_TRIGGER", 1, 1, 0, "")
-	if !contains(got2, "WEIRD_TRIGGER") {
-		t.Errorf("未识别的 trigger 必须把原值带出来：\n%s", got2)
+// 关掉的规则不必为 trigger 记 WARN —— 压根不会发，那条 WARN 只是噪音
+func TestDisabledPolicyDoesNotWarn(t *testing.T) {
+	if d := ShouldNotify(false, "没见过的写法"); d.Warn {
+		t.Error("规则没开通知时不该因为 trigger 认不出而记 WARN")
 	}
 }
 
-func contains(s, sub string) bool {
-	return len(sub) > 0 && len(s) >= len(sub) && (func() bool {
-		for i := 0; i+len(sub) <= len(s); i++ {
-			if s[i:i+len(sub)] == sub {
-				return true
-			}
+func TestIsFailedStatus(t *testing.T) {
+	for _, s := range []string{"Failed", "failure", "Error", "Stopped", " failed "} {
+		if !IsFailedStatus(s) {
+			t.Errorf("%q 应判为失败", s)
 		}
-		return false
-	})()
+	}
+	for _, s := range []string{"Succeeded", "Succeed", "InProgress", ""} {
+		if IsFailedStatus(s) {
+			t.Errorf("%q 不该判为失败", s)
+		}
+	}
 }

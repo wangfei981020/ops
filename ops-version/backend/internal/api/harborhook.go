@@ -307,9 +307,9 @@ func (s *Server) harborHook(w http.ResponseWriter, r *http.Request) {
 	//
 	//    这一步失败不影响主流程：拿不到就退回用 webhook 解析出的服务名，
 	//    归因会少版本号，但不会错。
-	if rep.ExecutionID > 0 {
-		if apiRows := s.tasksAtWebhookTime(r.Context(), rep.HarborHostname,
-			rep.ExecutionID, at); len(apiRows) > 0 {
+	hb := s.harborOfEvent(r.Context(), rep.HarborHostname)
+	if rep.ExecutionID > 0 && hb != nil {
+		if apiRows := s.tasksAtWebhookTime(r.Context(), hb, rep.ExecutionID, at); len(apiRows) > 0 {
 			withTag := 0
 			for _, x := range apiRows {
 				if x.Tag != "" {
@@ -350,7 +350,7 @@ func (s *Server) harborHook(w http.ResponseWriter, r *http.Request) {
 	if srcProject == "" && rep.SrcResource != nil {
 		srcProject = rep.SrcResource.Namespace
 	}
-	saved, matchedBy, err := s.St.SaveWebhookSyncTasks(r.Context(), policyName, destEndpoint, srcProject, rows)
+	saved, policyRef, matchedBy, err := s.St.SaveWebhookSyncTasks(r.Context(), policyName, destEndpoint, srcProject, rows)
 	if err != nil {
 		// 🔴 存不进去要**明说**并返回非 2xx？不 —— Harbor 不重发，返回 5xx 只是让它记一条失败。
 		//    但日志必须是 ERROR：这条链路断了的表现是「同步状态一直是未知」，
@@ -404,12 +404,42 @@ func (s *Server) harborHook(w http.ResponseWriter, r *http.Request) {
 	}
 	_ = s.St.TouchWebhookToken(r.Context(), matched, summary)
 
-	s.notifyReplication(r.Context(), rep.JobStatus, policyName, destEndpoint, srcProject, rows, at)
+	s.notifyReplication(r.Context(), hb, policyRef, replicationNotice{
+		JobStatus: rep.JobStatus, Trigger: rep.TriggerType, ExecID: rep.ExecutionID,
+		PolicyName: policyName, DestEndpoint: destEndpoint, SrcProject: srcProject,
+		At: at,
+	}, rows)
 	ok(w, map[string]any{"ok": true, "saved": saved})
+}
+
+// replicationNotice 一次复制事件里与「要不要通知、通知什么」有关的部分。
+//
+// ⚠️ 单独一个结构体而不是一串参数：原来是 7 个位置参数、其中 4 个 string
+// （policy / destEndpoint / srcProject / jobStatus），顺序写错编译照过。
+type replicationNotice struct {
+	JobStatus    string
+	Trigger      string
+	ExecID       int64
+	PolicyName   string
+	DestEndpoint string
+	SrcProject   string
+	At           time.Time
 }
 
 // notifyReplication 把复制结果发到已配置的通知渠道，接替原来那个独立的
 // harbor-replication 服务。
+//
+// # 发不发，只看这条规则的通知开关
+//
+// 🔴 不再按触发方式分级（原来是"自动触发且成功就不发"）。现在：
+//
+//	规则开了通知 → 成功、失败都发
+//	规则没开     → 一条都不发，落一条 skipped 说明原因
+//
+// 防刷屏由白名单承担（人只勾自己关心的几条规则），比按触发方式猜精确得多。
+//
+// ⚠️ 这条路是**实时**的（Harbor 一推事件就发）；采集器那条是**兜底**，
+// 靠 (规则, execution id) 去重，webhook 发成功过就不再重复发。
 //
 // ⚠️ 复用**已有的多渠道机制**（notify_channels + 三态记录），不另起一套：
 //
@@ -417,8 +447,8 @@ func (s *Server) harborHook(w http.ResponseWriter, r *http.Request) {
 //	而排查的人不知道该看哪一个。
 //
 // ⚠️ 通知失败不影响已经落库的同步记录 —— 数据是主线，通知是支线。
-func (s *Server) notifyReplication(ctx context.Context, jobStatus, policy,
-	destEndpoint, srcProject string, rows []store.WebhookSyncTask, at time.Time,
+func (s *Server) notifyReplication(ctx context.Context, hb *providers.Harbor,
+	policyRef int64, n replicationNotice, rows []store.WebhookSyncTask,
 ) {
 	okList, failList := []store.WebhookSyncTask{}, []store.WebhookSyncTask{}
 	for _, x := range rows {
@@ -429,62 +459,83 @@ func (s *Server) notifyReplication(ctx context.Context, jobStatus, policy,
 		}
 	}
 	level := notify.LevelOK
-	if len(failList) > 0 || notify.IsFailedStatus(jobStatus) {
+	if len(failList) > 0 || notify.IsFailedStatus(n.JobStatus) {
 		level = notify.LevelFailed
 	}
+	rec := store.NotifyRecordInput{
+		PolicyRef: policyRef, HarborExecID: n.ExecID,
+		Level: string(level), Trigger: n.Trigger,
+	}
 
-	// 🔴 **webhook 这条路成功也发**，与被它替代的 harbor-replication 保持一致。
+	// 🔴 没关联到规则就**不猜**。
 	//
-	//    这里不走 notify.ShouldNotify —— 那套分级（自动触发且成功只入库不发）
-	//    留给**采集器**那条路用，两条路都发成功通知会重复刷屏：
-	//    webhook 实时发一次，30 分钟后采集器发现同一条 execution 状态变化又发一次。
-	//
-	//    分工：webhook = 实时通知（主），采集器 = 兜底对账（只在失败时补发）。
-	//
-	// ⚠️ 通知失败不影响已经落库的同步记录 —— 数据是主线，通知是支线。
-	reason := "复制事件通知（成功也发，与原 harbor-replication 行为一致）"
+	//    通知开关挂在规则上，关联不上就无从判断该不该发。这时两种做法都是错的：
+	//    一律发 → 等于白名单被绕过，用户关掉的规则照样吵；
+	//    静默丢 → 事件真的是关心的那条规则时，人永远等不到通知且无痕迹。
+	//    所以：不发，但落一条 skipped 写明原因，界面上查得到。
+	if policyRef == 0 {
+		rec.State = "skipped"
+		rec.Reason = "事件没能关联到本站任何一条复制规则，无从判断是否该通知（见 policy_not_found 日志）"
+		_ = s.St.SaveNotifyRecord(ctx, rec)
+		return
+	}
+	p, err := s.St.PolicyByRef(ctx, policyRef)
+	if err != nil {
+		logx.Warn("webhook", "policy_row_failed", map[string]any{
+			"ref": policyRef, "err": err.Error()})
+		return
+	}
 
-	// Harbor 的 payload 里没有规则名，空着的话通知开头会是「Harbor 复制成功：」
-	// 后面跟一片空白 —— 收到的人不知道是哪条链路。用源项目→目标兜底。
-	label := strings.TrimSpace(policy)
-	if label == "" {
-		if srcProject != "" {
-			label = srcProject + " → " + shortHost(destEndpoint)
+	d := notify.ShouldNotify(p.NotifyEnabled, n.Trigger)
+	rec.Reason = d.Reason
+	if d.Warn {
+		logx.Warn("webhook", "unknown_trigger", map[string]any{
+			"trigger": n.Trigger, "policy": p.Name, "reason": d.Reason})
+	}
+	if !d.Send {
+		rec.State = "skipped"
+		_ = s.St.SaveNotifyRecord(ctx, rec)
+		return
+	}
+
+	rep := notify.Replication{
+		Level: level, Policy: p.Name, OrgName: p.OrgName, DestRegistry: p.DestRegistry,
+		Trigger: n.Trigger, ExecID: n.ExecID, SyncedAt: n.At, Realtime: true,
+		Succeeded: len(okList), Failed: len(failList), Total: len(rows),
+	}
+	// 🔴 耗时和总数只能从 execution 详情来 —— webhook 的 payload 里没有开始/结束时间，
+	//    而 artifact 数组只数得出"这一次推了几个"，数不出这条 execution 总共几个。
+	//    老的 harbor-replication 也是收到事件后回查这个接口算的。
+	//
+	// ⚠️ 查不到就保持零值：Card 会**整行不显示**耗时，而不是显示「0 秒」。
+	if hb != nil && n.ExecID > 0 {
+		if e, err := hb.Execution(ctx, n.ExecID); err == nil {
+			if !e.StartedAt.IsZero() && !e.EndedAt.IsZero() && e.EndedAt.After(e.StartedAt) {
+				rep.Duration = e.EndedAt.Sub(e.StartedAt)
+			}
+			if e.Total > 0 {
+				rep.Total, rep.Succeeded, rep.Failed = e.Total, e.Succeeded, e.Failed
+			}
+			if rep.Trigger == "" {
+				rep.Trigger = e.TriggerType
+			}
 		} else {
-			label = shortHost(destEndpoint)
+			logx.Info("webhook", "execution_detail_failed", map[string]any{
+				"exec_id": n.ExecID, "err": err.Error(),
+				"note": "拿不到耗时，通知里不显示那一行（不编一个 0 秒出来）"})
 		}
+	}
+	for _, x := range okList {
+		rep.OK = append(rep.OK, notify.Image{Service: x.ServiceKey, Tag: x.Tag})
+	}
+	for _, x := range failList {
+		rep.Bad = append(rep.Bad, notify.Image{
+			Service: x.ServiceKey, Tag: x.Tag, Reason: x.ErrMsg})
 	}
 
-	var b strings.Builder
-	fmt.Fprintf(&b, "%s Harbor 复制%s：%s\n", map[bool]string{true: "❌", false: "✅"}[level == notify.LevelFailed],
-		map[bool]string{true: "失败", false: "成功"}[level == notify.LevelFailed], label)
-	fmt.Fprintf(&b, "时间：%s\n成功 %d 个，失败 %d 个\n",
-		at.Format("2006-01-02 15:04:05"), len(okList), len(failList))
-	// 🔴 列出具体镜像。只报数量的话「成功 8 个」看不出少推了哪一个 ——
-	//    而少推的那个正是对账要问的。上限 10 条，超出说明被截断了。
-	show := func(title string, list []store.WebhookSyncTask) {
-		if len(list) == 0 {
-			return
-		}
-		fmt.Fprintf(&b, "%s\n", title)
-		for i, a := range list {
-			if i >= 10 {
-				fmt.Fprintf(&b, "…… 其余 %d 个未列出\n", len(list)-10)
-				break
-			}
-			// 🔴 带上版本号。原来这里打的是 a.NameTag，而那个字段的值是
-			//    `xxx [1 item(s) in total]` —— 通知里看不到版本号，
-			//    而版本号正是收通知的人唯一关心的东西。
-			if a.Tag != "" {
-				fmt.Fprintf(&b, "  %s:%s\n", a.ServiceKey, a.Tag)
-			} else {
-				fmt.Fprintf(&b, "  %s（未取到版本号）\n", a.ServiceKey)
-			}
-		}
-	}
-	show("成功：", okList)
-	show("失败：", failList)
-	text := b.String()
+	text := notify.Text(rep)
+	card := notify.Card(rep)
+	rec.Content = text
 
 	chans, err := s.St.ListChannels(ctx)
 	if err != nil {
@@ -495,6 +546,10 @@ func (s *Server) notifyReplication(ctx context.Context, jobStatus, policy,
 		if !ch.Enabled || ch.WebhookEnc == "" {
 			continue
 		}
+		// 渠道绑了平台就只发那个平台的 —— 与采集器那条路同一套判断
+		if ch.OrgID != nil && (p.OrgID == nil || *ch.OrgID != *p.OrgID) {
+			continue
+		}
 		hook, err := s.Ciph.Decrypt(ch.WebhookEnc)
 		if err != nil {
 			logx.Warn("webhook", "channel_decrypt_failed", map[string]any{"channel": ch.Name})
@@ -502,12 +557,13 @@ func (s *Server) notifyReplication(ctx context.Context, jobStatus, policy,
 		}
 		// ⚠️ 这里原来又声明了一个局部 reason，把外层那个遮蔽掉了，
 		//    于是通知记录里的「原因」一直是空串 —— 界面上看不出这条为什么发。
-		state, errMsg := "sent", ""
-		if err := notify.SendFeishu(hook, text); err != nil {
-			state, errMsg = "failed", err.Error()
+		r := rec
+		r.ChannelID, r.State, r.Attempts = ch.ID, "sent", 1
+		if err := notify.SendFeishuCard(hook, card); err != nil {
+			r.State, r.ErrMsg = "failed", err.Error()
 			logx.Warn("webhook", "notify_failed", map[string]any{"channel": ch.Name, "err": err.Error()})
 		}
-		_ = s.St.SaveNotifyRecord(ctx, ch.ID, 0, string(level), "event_based", state, reason, errMsg, text, 1)
+		_ = s.St.SaveNotifyRecord(ctx, r)
 	}
 }
 
@@ -576,17 +632,14 @@ func truncateStr(s string, n int) string {
 	return s[:n] + "…（已截断）"
 }
 
-// tasksAtWebhookTime 收到 webhook 的当下，立刻按 execution_id 回查任务明细。
+// harborOfEvent 按事件里的 harbor_hostname 找到本站对应的 Harbor 配置，建一个客户端。
 //
-// 🔴 时机就是全部意义所在：Harbor 的 task 里 `resource`（repository + tag）
-// 只在复制刚结束的一小段时间内有值，之后变成 null，只剩不带版本号的字符串。
-// 30 分钟一轮的定时采集去拉，拉到的必然是没有版本号的那份。
+// 🔴 回查任务明细（拿版本号、拿失败原因）和回查 execution 详情（拿耗时）
+// 用的是同一个客户端 —— 原来它藏在 tasksAtWebhookTime 里面，
+// 于是通知那边想查耗时就只能再复制一份找 Harbor 的逻辑。
 //
-// 任何一步失败都只记日志、返回空，让调用方退回 webhook 自带的信息 ——
-// 版本号是锦上添花，不能因为拿不到就把整条同步记录丢了。
-func (s *Server) tasksAtWebhookTime(ctx context.Context, hostname string,
-	execID int64, at time.Time,
-) []store.WebhookSyncTask {
+// 找不到返回 nil，调用方各自降级：没有版本号照样落库，没有耗时就不显示那一行。
+func (s *Server) harborOfEvent(ctx context.Context, hostname string) *providers.Harbor {
 	harbors, err := s.St.ListHarbors(ctx)
 	if err != nil {
 		logx.Warn("webhook", "list_harbors_failed", map[string]any{"err": err.Error()})
@@ -632,14 +685,41 @@ func (s *Server) tasksAtWebhookTime(ctx context.Context, hostname string,
 		}
 		pw = v
 	}
-	hb := &providers.Harbor{Endpoint: target.Endpoint, Username: target.Username,
+	return &providers.Harbor{Endpoint: target.Endpoint, Username: target.Username,
 		Password: pw, InsecureTLS: target.InsecureTLS}
+}
+
+// tasksAtWebhookTime 收到 webhook 的当下，立刻按 execution_id 回查任务明细。
+//
+// 🔴 时机就是全部意义所在：Harbor 的 task 里 `resource`（repository + tag）
+// 只在复制刚结束的一小段时间内有值，之后变成 null，只剩不带版本号的字符串。
+// 30 分钟一轮的定时采集去拉，拉到的必然是没有版本号的那份。
+//
+// 任何一步失败都只记日志、返回空，让调用方退回 webhook 自带的信息 ——
+// 版本号是锦上添花，不能因为拿不到就把整条同步记录丢了。
+func (s *Server) tasksAtWebhookTime(ctx context.Context, hb *providers.Harbor,
+	execID int64, at time.Time,
+) []store.WebhookSyncTask {
 	tasks, err := hb.Tasks(ctx, execID)
 	if err != nil {
 		logx.Warn("webhook", "api_tasks_failed", map[string]any{
-			"harbor": target.Name, "exec_id": execID, "err": err.Error()})
+			"exec_id": execID, "err": err.Error()})
 		return nil
 	}
+	// 🔴 只给**失败**的 task 拉日志，为的是通知里那行「原因」。
+	//
+	//    老的 harbor-replication 只报"失败 N 个"，收到的人还得自己去 Harbor 翻，
+	//    而原因就躺在 task 日志里。采集器那条路早就在拉了（harborsync.go），
+	//    webhook 这条路原来没拉 —— 同一件事两条路表现不一致。
+	//
+	// ⚠️ 只拉失败的：一次执行可能几百个 task，全拉会把 Harbor 打爆，
+	//    而成功任务的日志没有任何价值。
+	for i := range tasks {
+		if providers.IsFailed(tasks[i].Status) && tasks[i].TaskID > 0 {
+			tasks[i].ErrMsg = hb.TaskLog(ctx, execID, tasks[i].TaskID, 400)
+		}
+	}
+
 	out := make([]store.WebhookSyncTask, 0, len(tasks))
 	stale, noTag := 0, 0
 	for _, t := range tasks {
@@ -679,6 +759,7 @@ func (s *Server) tasksAtWebhookTime(ctx context.Context, hostname string,
 		}
 		out = append(out, store.WebhookSyncTask{
 			ServiceKey: t.ServiceKey, Tag: t.Tag, Status: t.Status, FinishedAt: fin,
+			TaskID: t.TaskID, ErrMsg: t.ErrMsg,
 		})
 	}
 	if stale > 0 || noTag > 0 {

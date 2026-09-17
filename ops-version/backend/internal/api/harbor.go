@@ -153,6 +153,35 @@ func (s *Server) bindPolicy(w http.ResponseWriter, r *http.Request) {
 	ok(w, map[string]any{"ok": true})
 }
 
+// setPolicyNotify 开/关某条复制规则的通知。
+//
+// 🔴 通知是**白名单**：只有在这里开过的规则才会发消息，成功失败都发；
+// 没开的规则一条都不发（失败也不发）。防刷屏靠"只勾自己关心的几条"，
+// 而不是靠按触发方式少发 —— 后者会把别人手动点的同步也推给你，
+// 同时又把你自己关心的自动同步压掉。
+//
+// ⚠️ 走 alert.write（管通知渠道那个权限），不是 org.write：
+// 这是"谁能决定什么消息进群"，与"谁能改平台配置"是两件事。
+func (s *Server) setPolicyNotify(w http.ResponseWriter, r *http.Request) {
+	ref, _ := strconv.ParseInt(r.PathValue("id"), 10, 64)
+	req, err := body[struct {
+		Enabled bool `json:"enabled"`
+	}](r)
+	if err != nil {
+		fail(w, http.StatusBadRequest, "bad_request", "请求格式不对")
+		return
+	}
+	e := s.St.SetPolicyNotify(r.Context(), ref, req.Enabled)
+	// 🔴 记审计：「群里怎么突然没通知了」要查得出是谁什么时候关的
+	s.St.Audit(r.Context(), userOf(r).Username, "harbor.policy_notify",
+		strconv.FormatInt(ref, 10), map[string]any{"enabled": req.Enabled}, e, clientIP(r))
+	if e != nil {
+		fail(w, http.StatusInternalServerError, "internal", e.Error())
+		return
+	}
+	ok(w, map[string]any{"ok": true})
+}
+
 func (s *Server) listExecutions(w http.ResponseWriter, r *http.Request) {
 	limit, _ := strconv.Atoi(r.URL.Query().Get("limit"))
 	// 复合游标：排序键是 (started_at, id)，游标就得是这两个 ——
@@ -174,7 +203,7 @@ func (s *Server) listExecutions(w http.ResponseWriter, r *http.Request) {
 
 // syncHarborsNow 手动触发一次同步拉取
 func (s *Server) syncHarborsNow(w http.ResponseWriter, r *http.Request) {
-	s.Coll.SyncHarbors(r.Context(), true)
+	s.Coll.SyncHarbors(r.Context())
 	s.St.Audit(r.Context(), userOf(r).Username, "harbor.sync", "", nil, nil, clientIP(r))
 	ok(w, map[string]any{"ok": true})
 }

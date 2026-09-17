@@ -273,6 +273,7 @@ func (s *Server) Routes() http.Handler {
 	mux.HandleFunc("POST /api/harbors/{id}/probe", s.requires(auth.PermOrgWrite, s.probeHarbor))
 	mux.HandleFunc("GET /api/sync/policies", s.requires(auth.PermView, s.listPolicies))
 	mux.HandleFunc("PUT /api/sync/policies/{id}/org", s.requires(auth.PermOrgWrite, s.bindPolicy))
+	mux.HandleFunc("PUT /api/sync/policies/{id}/notify", s.requires(auth.PermAlertWrite, s.setPolicyNotify))
 	mux.HandleFunc("GET /api/sync/executions", s.requires(auth.PermView, s.listExecutions))
 	mux.HandleFunc("GET /api/columns/freshness", s.requires(auth.PermView, s.columnFreshness))
 	mux.HandleFunc("POST /api/sync/refresh", s.requires(auth.PermSyncTrigger, s.syncHarborsNow))

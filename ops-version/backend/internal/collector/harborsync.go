@@ -13,14 +13,15 @@ import (
 
 // SyncHarbors 拉取所有启用的 Harbor 的复制记录。
 //
-// manualRun=true 表示是人点了「立即拉取」—— 这会让通知规则对
-// 「自动触发且成功」也回一条（人在等结果）。
+// ⚠️ 原来这里有个 manualRun 参数，用来让「人点了立即拉取」时连自动触发的成功
+// 也回一条通知。那套按触发方式分级的规则已经被**规则通知开关**取代
+// （notify.ShouldNotify），拉取是不是人点的不再影响发不发，参数就去掉了。
 //
 // 这一层的产出是**归因**：同样是「对方版本落后」，
 // 有了同步记录才能分清是「镜像没推过去」（我们的锅）
 // 还是「推过去了对方没发版」（对方的节奏）。
 // 没有它，两种情况在对账表上长得一模一样，而处理方式完全相反。
-func (c *Collector) SyncHarbors(ctx context.Context, manualRun bool) {
+func (c *Collector) SyncHarbors(ctx context.Context) {
 	hs, err := c.st.ListHarbors(ctx)
 	if err != nil {
 		logx.Error("harborsync", "list_failed", map[string]any{"err": err.Error()})
@@ -30,7 +31,7 @@ func (c *Collector) SyncHarbors(ctx context.Context, manualRun bool) {
 		if !h.Enabled {
 			continue
 		}
-		if err := c.syncOne(ctx, h, manualRun); err != nil {
+		if err := c.syncOne(ctx, h); err != nil {
 			// 🔴 分类落库，不要统一成「同步失败」——
 			//    密码错、网络不通、权限不足三种的处理方式完全不同
 			status := classify(err)
@@ -60,22 +61,7 @@ func (c *Collector) SyncHarbors(ctx context.Context, manualRun bool) {
 	}
 }
 
-// orgOfPolicy 取规则绑定的组织。没绑就返回空 —— 通知里会少一行「组织」，
-// 但不该因此不发（规则没绑定不影响同步本身失败这个事实）。
-func (c *Collector) orgOfPolicy(ctx context.Context, ref int64) (int64, string) {
-	ps, err := c.st.ListPolicies(ctx)
-	if err != nil {
-		return 0, ""
-	}
-	for _, p := range ps {
-		if p.Ref == ref && p.OrgID != nil {
-			return *p.OrgID, p.OrgName
-		}
-	}
-	return 0, ""
-}
-
-func (c *Collector) syncOne(ctx context.Context, h store.Harbor, manualRun bool) error {
+func (c *Collector) syncOne(ctx context.Context, h store.Harbor) error {
 	pw := ""
 	if h.CredentialEnc != "" {
 		v, err := c.dec.Decrypt(h.CredentialEnc)
@@ -129,17 +115,18 @@ func (c *Collector) syncOne(ctx context.Context, h store.Harbor, manualRun bool)
 		if err != nil {
 			return err
 		}
-		// 只对**状态变化的**执行发通知。每轮拉取都会看到同样的历史执行，
-		// 无条件通知的话一条三天前的失败会被反复重发
-		for _, e := range changed {
-			orgID, orgName := c.orgOfPolicy(ctx, ref)
-			c.notifyExecution(ctx, ref, orgID, orgName, p.Name, e, manualRun)
-		}
 
 		// 任务明细的拉取结果要统计出来：executions 拉到了而 tasks 一条没拉到时，
 		// 「按服务查同步」整个不可用、比对页的归因全变成「同步状态未知」，
 		// 而这两处表现都不指向 Harbor 拉取 —— 不汇总的话没人知道断在这一层
 		taskOK, taskFail, skipped := 0, 0, 0
+		// 通知要带镜像明细，所以**先拉 tasks 再发通知**（原来顺序是反的，
+		// 那时通知里只有数量）。只留状态变化的那几条，其余历史执行不占内存。
+		changedSet := map[int64]bool{}
+		for _, e := range changed {
+			changedSet[e.ExecID] = true
+		}
+		tasksOf := map[int64][]providers.SyncTask{}
 		for _, e := range execs {
 			// 进行中的执行任务列表还会变，跳过 —— 下一轮采集再拉
 			if !providers.IsSucceeded(e.Status) && !providers.IsFailed(e.Status) {
@@ -169,6 +156,28 @@ func (c *Collector) syncOne(ctx context.Context, h store.Harbor, manualRun bool)
 			}
 			if err := c.st.SaveTasks(ctx, ref, e.ExecID, tasks); err != nil {
 				return err
+			}
+			if changedSet[e.ExecID] {
+				tasksOf[e.ExecID] = tasks
+			}
+		}
+
+		// 只对**状态变化的**执行发通知。每轮拉取都会看到同样的历史执行，
+		// 无条件通知的话一条三天前的失败会被反复重发。
+		//
+		// ⚠️ 规则信息（通知开关、绑的平台、目标地址）一次查出来给所有 execution 用：
+		// 原来是每条 execution 调一次 ListPolicies 再遍历找，规则多了就是
+		// 一轮采集几十次全表查询。
+		if len(changed) > 0 {
+			prow, err := c.st.PolicyByRef(ctx, ref)
+			if err != nil {
+				logx.Warn("harborsync", "policy_row_failed", map[string]any{
+					"policy": p.Name, "ref": ref, "err": err.Error(),
+					"note": "查不到规则本身，这一轮不发通知 —— 发不出「推给谁」的通知没有意义"})
+			} else {
+				for _, e := range changed {
+					c.notifyExecution(ctx, ref, prow, e, tasksOf[e.ExecID])
+				}
 			}
 		}
 		// 🔴 「一次都没拉到」单独升一级：这正是 的现场 ——
@@ -202,13 +211,13 @@ func (c *Collector) RunHarborLoop(ctx context.Context, every time.Duration) {
 	}
 	t := time.NewTicker(every)
 	defer t.Stop()
-	c.SyncHarbors(ctx, false)
+	c.SyncHarbors(ctx)
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case <-t.C:
-			c.SyncHarbors(ctx, false)
+			c.SyncHarbors(ctx)
 		}
 	}
 }

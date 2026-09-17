@@ -95,6 +95,11 @@ type WebhookSyncTask struct {
 	Tag        string
 	Status     string
 	FinishedAt time.Time
+	// TaskID Harbor 的 task id。只有回查 API 那条路径才有 ——
+	// webhook payload 里的 artifact 不带它。失败原因要靠它去拉日志。
+	TaskID int64
+	// ErrMsg 失败原因（Harbor task 日志，已截断）。空 = 成功，或没去拉。
+	ErrMsg string
 }
 
 // SaveWebhookSyncTasks 把 webhook 推来的复制结果写进 sync_tasks，返回落库条数。
@@ -112,31 +117,37 @@ type WebhookSyncTask struct {
 //
 // ⚠️ 策略名对不上时返回 0 而不是报错：Harbor 那边改过策略名、
 //
-//	或这条策略我们还没拉取过，都会这样。调用方据此打 WARN —— 
+//	或这条策略我们还没拉取过，都会这样。调用方据此打 WARN ——
 //	静默丢弃的话，表现是「webhook 配了但同步状态还是未知」，没人查得到原因。
+//
+// 返回的 ref 是匹配到的 sync_policies.id（0 = 没匹配上）。
+//
+// 🔴 ref 必须回给调用方：通知要不要发，取决于**那条规则**的通知开关，
+// 而这里是整条链路上唯一一处知道是哪条规则的地方。
 func (s *Store) SaveWebhookSyncTasks(ctx context.Context, policyName, destEndpoint, srcProject string,
 	list []WebhookSyncTask,
-) (saved int, matchedBy string, err error) {
+) (saved int, ref int64, matchedBy string, err error) {
 	if len(list) == 0 {
-		return 0, "", nil
+		return 0, 0, "", nil
 	}
-	ref, matchedBy, err := s.resolvePolicy(ctx, policyName, destEndpoint, srcProject)
+	ref, matchedBy, err = s.resolvePolicy(ctx, policyName, destEndpoint, srcProject)
 	if err != nil || ref == 0 {
-		return 0, matchedBy, err
+		return 0, ref, matchedBy, err
 	}
 	n := 0
 	for _, t := range list {
 		if _, err := s.db.ExecContext(ctx, `
 			INSERT INTO sync_tasks (policy_ref, exec_id, service_key, tag, status, err_msg, finished_at, source)
-			VALUES (?,0,?,?,?,'',?, 'webhook')
-			ON DUPLICATE KEY UPDATE status=VALUES(status), finished_at=VALUES(finished_at),
-			  source='webhook'`,
-			ref, t.ServiceKey, t.Tag, t.Status, nullIfZero(t.FinishedAt)); err != nil {
-			return n, matchedBy, err
+			VALUES (?,0,?,?,?,?,?, 'webhook')
+			ON DUPLICATE KEY UPDATE status=VALUES(status), err_msg=VALUES(err_msg),
+			  finished_at=VALUES(finished_at), source='webhook'`,
+			ref, t.ServiceKey, t.Tag, t.Status, truncate(t.ErrMsg, 500),
+			nullIfZero(t.FinishedAt)); err != nil {
+			return n, ref, matchedBy, err
 		}
 		n++
 	}
-	return n, matchedBy, nil
+	return n, ref, matchedBy, nil
 }
 
 // resolvePolicy 把 webhook 事件关联回一条复制规则。
