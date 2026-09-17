@@ -47,22 +47,25 @@ func (c *Collector) notifyExecution(ctx context.Context, execRef int64, p store.
 		return
 	}
 
-	// 🔴 去重：webhook 已经实时发过这条 execution 就不再发。
+	// 🔴 去重：一次执行只发一张卡，webhook 发过了这里就不再发。
 	//
 	//    「成功也发」之后两条路会同时命中同一次复制 —— webhook 收到事件发一张，
 	//    30 分钟后轮询看到这条 execution 是新的又发一张，内容一模一样。
 	//    以前不撞车纯属巧合：那时采集器对「自动触发且成功」不发。
 	//
-	// ⚠️ 查询失败时**照发不误**：漏发一条失败通知的代价，比多发一条重复的大得多。
-	done, err := c.st.AlreadyNotified(ctx, p.Ref, e.ExecID)
+	//    用**占位表**而不是"查一下发过没有"：后者是先查后写，
+	//    并发下两边都查到"没发过"。见 store.ClaimNotify。
+	//
+	// ⚠️ 占位失败（数据库出错）时**照发不误**：漏发一条失败通知的代价，
+	//    比多发一条重复的大得多。
+	got, err := c.st.ClaimNotify(ctx, p.Ref, e.ExecID, "collector")
 	if err != nil {
-		logx.Warn("notify", "dedup_check_failed", map[string]any{
+		logx.Warn("notify", "claim_failed", map[string]any{
 			"policy": p.Name, "exec": e.ExecID, "err": err.Error(),
-			"note": "查不到是否已通知，按未通知处理 —— 宁可重复也不能漏"})
-	}
-	if done {
+			"note": "占位失败，按未通知处理 —— 宁可重复也不能漏"})
+	} else if !got {
 		rec.State = "skipped"
-		rec.Reason = "webhook 已实时通知过这次执行，不重复发送"
+		rec.Reason = "这次执行已由 webhook 实时通知过，不重复发送"
 		_ = c.st.SaveNotifyRecord(ctx, rec)
 		metrics.NotifyTotal.WithLabelValues(string(level), "skipped").Inc()
 		return
@@ -81,9 +84,9 @@ func (c *Collector) notifyExecution(ctx context.Context, execRef int64, p store.
 	if rep.SyncedAt.IsZero() {
 		rep.SyncedAt = e.StartedAt
 	}
-	if !e.StartedAt.IsZero() && !e.EndedAt.IsZero() && e.EndedAt.After(e.StartedAt) {
-		rep.Duration = e.EndedAt.Sub(e.StartedAt)
-	}
+	// 耗时与 webhook 那条路同一个口径（终态时 Harbor 没写 end_time 就用现在时刻估，标 ≈）
+	rep.Duration, rep.Approx = notify.DurationOf(e.StartedAt, e.EndedAt, time.Now(),
+		providers.IsSucceeded(e.Status) || providers.IsFailed(e.Status))
 	for _, t := range tasks {
 		im := notify.Image{Service: t.ServiceKey, Tag: t.Tag}
 		if providers.IsFailed(t.Status) {
@@ -142,6 +145,11 @@ func (c *Collector) notifyExecution(ctx context.Context, execRef int64, p store.
 		rec.ErrMsg = "没有配置任何通知渠道，消息未送出"
 		_ = c.st.SaveNotifyRecord(ctx, rec)
 		metrics.NotifyTotal.WithLabelValues(string(level), "failed").Inc()
+	}
+	// 🔴 一条都没发出去就把占位还回去，否则下一轮采集也不会再试 ——
+	//    表现是"这次同步永远没通知"，而记录里只有一条 failed 没人看。
+	if !sent {
+		_ = c.st.ReleaseNotifyClaim(ctx, p.Ref, e.ExecID)
 	}
 }
 

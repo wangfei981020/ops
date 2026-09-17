@@ -38,9 +38,17 @@ type Replication struct {
 	Total        int
 	Succeeded    int
 	Failed       int
-	// Duration 这次复制耗时。0 = 没查到（**不显示这一行**，绝不显示「0 秒」：
-	// 「0 秒」和「没查到」是两回事，前者是事实后者是缺失）。
+	// Duration 这次复制耗时。
+	//
+	// 🔴 **终态的卡片必须有耗时**（用户 2026-09-17 明确要求：老服务每条都有，
+	// 换了新版反而没有说不过去）。取值见 DurationOf 的兜底链。
+	//
+	// 0 = 连开始时间都没拿到，那时整行不显示 —— 绝不显示「0 秒」：
+	// 「0 秒」是事实陈述（瞬间完成），「没查到」是数据缺失，两者不能长成一样。
 	Duration time.Duration
+	// Approx 耗时是估算的（Harbor 没给结束时间，用"收到事件的时刻"减开始时间），
+	// 文案里会写成「≈ 36 秒」。
+	Approx bool
 	// SyncedAt 复制发生的时刻 —— 不是发通知的时刻。
 	//
 	// 🔴 兜底补发最晚会晚 30 分钟，而飞书卡片上那个时间戳是**消息送达时间**。
@@ -138,13 +146,42 @@ func summaryLines(r Replication) string {
 		fmt.Fprintf(&b, "**结果**　成功 %d · 失败 0\n", r.Succeeded)
 	}
 
-	// 耗时查不到就整行不写 —— 写「0 秒」会被当成事实
+	// 耗时连开始时间都没有时才整行不写 —— 写「0 秒」会被当成事实
 	if r.Duration > 0 {
-		fmt.Fprintf(&b, "**耗时**　%s · %s", humanDuration(r.Duration), triggerText(r.Trigger))
+		d := humanDuration(r.Duration)
+		if r.Approx {
+			// Harbor 没给结束时间，这是用"收到事件的时刻"估的。标出来，
+			// 别让人拿它去对 SLA —— 但也不能不显示，老服务每条都有耗时。
+			d = "≈ " + d
+		}
+		fmt.Fprintf(&b, "**耗时**　%s · %s", d, triggerText(r.Trigger))
 	} else {
 		fmt.Fprintf(&b, "**触发**　%s", triggerText(r.Trigger))
 	}
 	return b.String()
+}
+
+// DurationOf 算这次复制的耗时，两条路都用它 —— 口径不能有两套。
+//
+// 🔴 兜底链（用户要求终态卡片一定要有耗时）：
+//
+//	① end_time − start_time      权威值
+//	② now − start_time           Harbor 还没写回 end_time 时的估算，标 ≈
+//	③ 0                          连 start_time 都没有，整行不显示
+//
+// ⚠️ ② 只在**执行已到终态**时才用。执行还在跑时算出来的是"已经跑了多久"，
+// 那不是耗时，写进卡片会被当成最终结果。
+func DurationOf(started, ended, now time.Time, terminal bool) (time.Duration, bool) {
+	if started.IsZero() {
+		return 0, false
+	}
+	if !ended.IsZero() && ended.After(started) {
+		return ended.Sub(started), false
+	}
+	if terminal && now.After(started) {
+		return now.Sub(started), true
+	}
+	return 0, false
 }
 
 func imageBlock(title string, list []Image, total int) string {

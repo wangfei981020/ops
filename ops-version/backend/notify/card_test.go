@@ -162,3 +162,65 @@ func TestUnboundOrgIsExplicit(t *testing.T) {
 		t.Errorf("没绑平台要如实写出来：\n%s", got)
 	}
 }
+
+/*
+🔴 终态卡片**必须有耗时**。
+
+用户 2026-09-17 的原话：「原来的都有耗时，不可能改版本后，没有发送耗时」。
+Harbor 在 execution 还没收尾时 end_time 是空的 —— 那时不该发卡（等终态），
+而万一终态了 end_time 仍为空，就用"现在"估一个并标 ≈，而不是整行消失。
+*/
+func TestDurationFallback(t *testing.T) {
+	start := time.Date(2026, 9, 17, 17, 2, 0, 0, time.UTC)
+	end := start.Add(36 * time.Second)
+	now := start.Add(50 * time.Second)
+
+	// ① 有结束时间 → 权威值，不标 ≈
+	if d, approx := DurationOf(start, end, now, true); d != 36*time.Second || approx {
+		t.Errorf("有 end_time 时应取 end-start 且不标估算，实得 %v approx=%v", d, approx)
+	}
+	// ② 终态但没有结束时间 → 用 now 估，标 ≈
+	if d, approx := DurationOf(start, time.Time{}, now, true); d != 50*time.Second || !approx {
+		t.Errorf("终态缺 end_time 应估算并标 ≈，实得 %v approx=%v", d, approx)
+	}
+	// ③ 还在进行中 → 不算。算出来的是"已经跑了多久"，不是耗时
+	if d, _ := DurationOf(start, time.Time{}, now, false); d != 0 {
+		t.Errorf("进行中不该给耗时（那是已用时长，不是结果），实得 %v", d)
+	}
+	// ④ 连开始时间都没有 → 0，卡片整行不显示
+	if d, _ := DurationOf(time.Time{}, time.Time{}, now, true); d != 0 {
+		t.Errorf("没有开始时间时不能编一个耗时出来，实得 %v", d)
+	}
+}
+
+// ≈ 要出现在文案里，别让人拿估算值去对 SLA
+func TestApproxDurationIsMarked(t *testing.T) {
+	r := sample()
+	r.Duration, r.Approx = 36*time.Second, true
+	got := Text(r)
+	if !strings.Contains(got, "≈ 36 秒") {
+		t.Errorf("估算的耗时要标 ≈：\n%s", got)
+	}
+}
+
+/*
+一次同步 100 个镜像 → **一张卡**，列 10 条，并说清还有 90 条没列。
+
+Harbor 是每推一个镜像发一次 webhook，真按事件发就是 100 张卡，
+而飞书自定义机器人限频 100 次/分钟、5 次/秒 —— 必然有发不出去的。
+*/
+func TestHundredImagesStayOneCard(t *testing.T) {
+	r := sample()
+	r.OK = nil
+	for i := 0; i < 100; i++ {
+		r.OK = append(r.OK, Image{Service: "svc-" + string(rune('a'+i%26)), Tag: "20260917-1"})
+	}
+	r.Total, r.Succeeded = 100, 100
+	got := Text(r)
+	if !strings.Contains(got, "共 100 个") || !strings.Contains(got, "其余 90 个未列出") {
+		t.Errorf("100 个镜像要汇总成一张卡并说清截断：\n%s", got)
+	}
+	if n := strings.Count(got, "20260917-1"); n != 10 {
+		t.Errorf("应只列 10 条版本号，实得 %d 条", n)
+	}
+}

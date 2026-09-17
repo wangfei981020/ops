@@ -412,6 +412,16 @@ func (s *Server) harborHook(w http.ResponseWriter, r *http.Request) {
 	ok(w, map[string]any{"ok": true, "saved": saved})
 }
 
+// recheckDelays 收到"复制还在进行中"的事件后，隔多久回查一次 execution。
+//
+// 🔴 为什么需要它：汇总卡只在 execution 终态时才发，而**最后一个镜像的 webhook
+// 到达时，Harbor 往往还没把 execution 写成终态**（它要等所有 task 收尾）。
+// 没有重查的话，这次复制要等采集器 30 分钟后轮询才补发 —— 慢得像没通知。
+//
+// 三次递增：绝大多数复制在最后一个事件后几秒内收尾；30 秒还没终态的，
+// 交给采集器兜底就行，不值得在这里挂更久。
+var recheckDelays = []time.Duration{5 * time.Second, 15 * time.Second, 30 * time.Second}
+
 // replicationNotice 一次复制事件里与「要不要通知、通知什么」有关的部分。
 //
 // ⚠️ 单独一个结构体而不是一串参数：原来是 7 个位置参数、其中 4 个 string
@@ -429,44 +439,32 @@ type replicationNotice struct {
 // notifyReplication 把复制结果发到已配置的通知渠道，接替原来那个独立的
 // harbor-replication 服务。
 //
-// # 发不发，只看这条规则的通知开关
+// # 一次复制只发一张卡
 //
-// 🔴 不再按触发方式分级（原来是"自动触发且成功就不发"）。现在：
+// 🔴 **Harbor 是每推一个镜像发一次 webhook**，不是一次复制发一次。
+// 一次手动同步 100 个镜像就会推 100 次 —— 每次都发的话就是 100 张卡，
+// 而飞书自定义机器人限频 100 次/分钟、**5 次/秒**，秒级连发必然有发不出去的。
+//
+// 所以这里只在 **execution 到终态**时发一张汇总卡（镜像明细从 tasks 取全量）：
+//
+//	还在进行中 → 只落库，不发；安排一次短延迟重查（见 recheckDelays）
+//	已终态     → 抢占位，抢到的发一张，抢不到的说明别人正在发
+//
+// 顺带解决了耗时：execution 终态时 Harbor 才写回 end_time，
+// 进行中时那个字段是空的 —— 这正是升级后卡片上没有耗时的原因。
+//
+// # 发不发，只看这条规则的通知开关
 //
 //	规则开了通知 → 成功、失败都发
 //	规则没开     → 一条都不发，落一条 skipped 说明原因
 //
-// 防刷屏由白名单承担（人只勾自己关心的几条规则），比按触发方式猜精确得多。
-//
-// ⚠️ 这条路是**实时**的（Harbor 一推事件就发）；采集器那条是**兜底**，
-// 靠 (规则, execution id) 去重，webhook 发成功过就不再重复发。
-//
-// ⚠️ 复用**已有的多渠道机制**（notify_channels + 三态记录），不另起一套：
-//
-//	另起一套的话，「为什么这条没通知我」会有两个互不相干的答案，
-//	而排查的人不知道该看哪一个。
+// ⚠️ 这条路是**实时**的；采集器那条是**兜底**，靠同一张占位表去重，
+// webhook 发成功过就不再重复发。
 //
 // ⚠️ 通知失败不影响已经落库的同步记录 —— 数据是主线，通知是支线。
 func (s *Server) notifyReplication(ctx context.Context, hb *providers.Harbor,
 	policyRef int64, n replicationNotice, rows []store.WebhookSyncTask,
 ) {
-	okList, failList := []store.WebhookSyncTask{}, []store.WebhookSyncTask{}
-	for _, x := range rows {
-		if providers.IsFailed(x.Status) {
-			failList = append(failList, x)
-		} else {
-			okList = append(okList, x)
-		}
-	}
-	level := notify.LevelOK
-	if len(failList) > 0 || notify.IsFailedStatus(n.JobStatus) {
-		level = notify.LevelFailed
-	}
-	rec := store.NotifyRecordInput{
-		PolicyRef: policyRef, HarborExecID: n.ExecID,
-		Level: string(level), Trigger: n.Trigger,
-	}
-
 	// 🔴 没关联到规则就**不猜**。
 	//
 	//    通知开关挂在规则上，关联不上就无从判断该不该发。这时两种做法都是错的：
@@ -474,9 +472,11 @@ func (s *Server) notifyReplication(ctx context.Context, hb *providers.Harbor,
 	//    静默丢 → 事件真的是关心的那条规则时，人永远等不到通知且无痕迹。
 	//    所以：不发，但落一条 skipped 写明原因，界面上查得到。
 	if policyRef == 0 {
-		rec.State = "skipped"
-		rec.Reason = "事件没能关联到本站任何一条复制规则，无从判断是否该通知（见 policy_not_found 日志）"
-		_ = s.St.SaveNotifyRecord(ctx, rec)
+		_ = s.St.SaveNotifyRecord(ctx, store.NotifyRecordInput{
+			HarborExecID: n.ExecID, Level: string(notify.LevelOK), Trigger: n.Trigger,
+			State:  "skipped",
+			Reason: "事件没能关联到本站任何一条复制规则，无从判断是否该通知（见 policy_not_found 日志）",
+		})
 		return
 	}
 	p, err := s.St.PolicyByRef(ctx, policyRef)
@@ -487,43 +487,154 @@ func (s *Server) notifyReplication(ctx context.Context, hb *providers.Harbor,
 	}
 
 	d := notify.ShouldNotify(p.NotifyEnabled, n.Trigger)
-	rec.Reason = d.Reason
 	if d.Warn {
 		logx.Warn("webhook", "unknown_trigger", map[string]any{
 			"trigger": n.Trigger, "policy": p.Name, "reason": d.Reason})
 	}
 	if !d.Send {
-		rec.State = "skipped"
-		_ = s.St.SaveNotifyRecord(ctx, rec)
+		// ⚠️ 规则没开通知时**每个事件都记一条** skipped：一次复制 100 个镜像
+		//    就是 100 行。所以只记一条——用占位表把它压成"每次执行一条"。
+		if first, err := s.St.ClaimNotify(ctx, policyRef, n.ExecID, "webhook-skip"); err == nil && first {
+			_ = s.St.SaveNotifyRecord(ctx, store.NotifyRecordInput{
+				PolicyRef: policyRef, HarborExecID: n.ExecID,
+				Level: string(notify.LevelOK), Trigger: n.Trigger,
+				State: "skipped", Reason: d.Reason,
+			})
+		}
 		return
 	}
 
-	rep := notify.Replication{
-		Level: level, Policy: p.Name, OrgName: p.OrgName, DestRegistry: p.DestRegistry,
-		Trigger: n.Trigger, ExecID: n.ExecID, SyncedAt: n.At, Realtime: true,
-		Succeeded: len(okList), Failed: len(failList), Total: len(rows),
+	if hb == nil || n.ExecID <= 0 {
+		// 没有 execution id 就聚合不了（也去重不了）。退回"按这次事件发一张"，
+		// 总比不发强；这种情况只会在 Harbor 没给 execution_id 时出现。
+		logx.Info("webhook", "notify_without_exec", map[string]any{
+			"policy": p.Name, "has_harbor": hb != nil, "exec_id": n.ExecID,
+			"note": "拿不到 execution，无法按执行汇总，按本次事件发一张"})
+		s.sendReplicationCard(ctx, p, n, rows, notify.Replication{}, d.Reason, true)
+		return
 	}
-	// 🔴 耗时和总数只能从 execution 详情来 —— webhook 的 payload 里没有开始/结束时间，
-	//    而 artifact 数组只数得出"这一次推了几个"，数不出这条 execution 总共几个。
-	//    老的 harbor-replication 也是收到事件后回查这个接口算的。
-	//
-	// ⚠️ 查不到就保持零值：Card 会**整行不显示**耗时，而不是显示「0 秒」。
-	if hb != nil && n.ExecID > 0 {
-		if e, err := hb.Execution(ctx, n.ExecID); err == nil {
-			if !e.StartedAt.IsZero() && !e.EndedAt.IsZero() && e.EndedAt.After(e.StartedAt) {
-				rep.Duration = e.EndedAt.Sub(e.StartedAt)
+	s.notifyIfTerminal(ctx, hb, p, n, 0)
+}
+
+// notifyIfTerminal 查一次 execution：终态就汇总发，进行中就安排下一次重查。
+//
+// attempt 是第几次重查（0 = webhook 刚到时那次）。
+func (s *Server) notifyIfTerminal(ctx context.Context, hb *providers.Harbor,
+	p store.PolicyRow, n replicationNotice, attempt int,
+) {
+	e, err := hb.Execution(ctx, n.ExecID)
+	if err != nil {
+		// 🔴 查不到就退回"按本次事件发"，不能静默丢：拿不到 execution 详情
+		//    是外部系统的问题，不该让用户一条通知都收不到。
+		logx.Warn("webhook", "execution_detail_failed", map[string]any{
+			"exec_id": n.ExecID, "attempt": attempt, "err": err.Error(),
+			"note": "拿不到执行详情，退回按本次事件发一张（没有汇总、没有耗时）"})
+		s.sendReplicationCard(ctx, p, n, nil, notify.Replication{}, "执行详情查不到，按本次事件发送", true)
+		return
+	}
+
+	terminal := providers.IsSucceeded(e.Status) || providers.IsFailed(e.Status)
+	if !terminal {
+		// 还在推别的镜像 —— 这次不发。
+		//
+		// ⚠️ 只有第一个事件负责安排重查：一次复制 100 个事件，
+		//    每个都排一遍就是 100 条重查链。用占位表把"谁来排"定死。
+		if attempt == 0 {
+			if first, err := s.St.ClaimNotify(ctx, p.Ref, n.ExecID, "webhook-recheck"); err == nil && first {
+				// 排上了重查就把占位还回去 —— 占位是给"发送"用的，
+				// 不还的话真要发的时候自己反而抢不到
+				_ = s.St.ReleaseNotifyClaim(ctx, p.Ref, n.ExecID)
+				go s.recheckLater(hb, p, n)
 			}
-			if e.Total > 0 {
-				rep.Total, rep.Succeeded, rep.Failed = e.Total, e.Succeeded, e.Failed
-			}
-			if rep.Trigger == "" {
-				rep.Trigger = e.TriggerType
-			}
-		} else {
-			logx.Info("webhook", "execution_detail_failed", map[string]any{
-				"exec_id": n.ExecID, "err": err.Error(),
-				"note": "拿不到耗时，通知里不显示那一行（不编一个 0 秒出来）"})
 		}
+		logx.Debug("webhook", "exec_in_progress", map[string]any{
+			"exec_id": n.ExecID, "status": e.Status, "attempt": attempt,
+			"note": "复制还在进行，等终态再汇总发一张（Harbor 每推一个镜像就推一次事件）"})
+		return
+	}
+
+	// 终态：抢占位，一次执行只有一个人发得出去
+	got, err := s.St.ClaimNotify(ctx, p.Ref, n.ExecID, "webhook")
+	if err != nil {
+		logx.Warn("webhook", "claim_failed", map[string]any{
+			"exec_id": n.ExecID, "err": err.Error(),
+			"note": "占位失败，按发送处理 —— 宁可重复也不能漏"})
+	} else if !got {
+		logx.Debug("webhook", "already_claimed", map[string]any{
+			"exec_id": n.ExecID, "note": "这次执行已经有人在发了"})
+		return
+	}
+
+	// 汇总：镜像明细取这次 execution 的**全部** task，而不是本次事件那一个
+	all := s.tasksAtWebhookTime(ctx, hb, n.ExecID, n.At)
+	base := notify.Replication{
+		Total: e.Total, Succeeded: e.Succeeded, Failed: e.Failed,
+	}
+	base.Duration, base.Approx = notify.DurationOf(e.StartedAt, e.EndedAt, time.Now(), true)
+	if base.Duration == 0 {
+		logx.Warn("webhook", "duration_unknown", map[string]any{
+			"exec_id": n.ExecID, "started_at": e.StartedAt, "ended_at": e.EndedAt,
+			"note": "Harbor 连开始时间都没给，卡片上不显示耗时那一行"})
+	}
+	if n.Trigger == "" {
+		n.Trigger = e.TriggerType
+	}
+	if !e.EndedAt.IsZero() {
+		n.At = e.EndedAt
+	}
+	n.JobStatus = e.Status
+	s.sendReplicationCard(ctx, p, n, all, base, "该规则已开启通知；这次执行已结束，汇总发送", true)
+}
+
+// recheckLater 隔几秒再查一次 execution，直到终态或者试完。
+//
+// ⚠️ 用独立的 context：HTTP 请求的 ctx 在响应写完那一刻就取消了，
+// 拿它去做后台重查等于一次都查不成。
+//
+// ⚠️ 进程重启会把这些定时器全丢掉 —— 那时由采集器兜底补发（30 分钟一轮），
+// 卡片上会标「兜底补发」。不为此加持久化队列：代价远大于收益。
+func (s *Server) recheckLater(hb *providers.Harbor, p store.PolicyRow, n replicationNotice) {
+	for i, d := range recheckDelays {
+		time.Sleep(d)
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		s.notifyIfTerminal(ctx, hb, p, n, i+1)
+		cancel()
+		// 发出去了（或者别人发了）就收工 —— 占位表里有行就说明这次执行有人管了
+		if done, err := s.St.AlreadyClaimed(context.Background(), p.Ref, n.ExecID); err == nil && done {
+			return
+		}
+	}
+	logx.Info("webhook", "recheck_gave_up", map[string]any{
+		"exec_id": n.ExecID, "policy": p.Name,
+		"note": "重查完仍未终态，交给采集器兜底补发（最多 30 分钟）"})
+}
+
+// sendReplicationCard 组卡片并投递到所有匹配的渠道。
+//
+// base 里可以先填好从 execution 详情拿到的总数与耗时；rows 是要列出来的镜像。
+func (s *Server) sendReplicationCard(ctx context.Context, p store.PolicyRow,
+	n replicationNotice, rows []store.WebhookSyncTask, base notify.Replication,
+	reason string, realtime bool,
+) {
+	okList, failList := []store.WebhookSyncTask{}, []store.WebhookSyncTask{}
+	for _, x := range rows {
+		if providers.IsFailed(x.Status) {
+			failList = append(failList, x)
+		} else {
+			okList = append(okList, x)
+		}
+	}
+	level := notify.LevelOK
+	if len(failList) > 0 || notify.IsFailedStatus(n.JobStatus) || base.Failed > 0 {
+		level = notify.LevelFailed
+	}
+
+	rep := base
+	rep.Level = level
+	rep.Policy, rep.OrgName, rep.DestRegistry = p.Name, p.OrgName, p.DestRegistry
+	rep.Trigger, rep.ExecID, rep.SyncedAt, rep.Realtime = n.Trigger, n.ExecID, n.At, realtime
+	if rep.Total == 0 {
+		rep.Total, rep.Succeeded, rep.Failed = len(rows), len(okList), len(failList)
 	}
 	for _, x := range okList {
 		rep.OK = append(rep.OK, notify.Image{Service: x.ServiceKey, Tag: x.Tag})
@@ -535,13 +646,17 @@ func (s *Server) notifyReplication(ctx context.Context, hb *providers.Harbor,
 
 	text := notify.Text(rep)
 	card := notify.Card(rep)
-	rec.Content = text
+	rec := store.NotifyRecordInput{
+		PolicyRef: p.Ref, HarborExecID: n.ExecID, Level: string(level),
+		Trigger: n.Trigger, Reason: reason, Content: text,
+	}
 
 	chans, err := s.St.ListChannels(ctx)
 	if err != nil {
 		logx.Error("webhook", "list_channels_failed", map[string]any{"err": err.Error()})
 		return
 	}
+	sent, tried := false, false
 	for _, ch := range chans {
 		if !ch.Enabled || ch.WebhookEnc == "" {
 			continue
@@ -550,6 +665,7 @@ func (s *Server) notifyReplication(ctx context.Context, hb *providers.Harbor,
 		if ch.OrgID != nil && (p.OrgID == nil || *ch.OrgID != *p.OrgID) {
 			continue
 		}
+		tried = true
 		hook, err := s.Ciph.Decrypt(ch.WebhookEnc)
 		if err != nil {
 			logx.Warn("webhook", "channel_decrypt_failed", map[string]any{"channel": ch.Name})
@@ -562,8 +678,21 @@ func (s *Server) notifyReplication(ctx context.Context, hb *providers.Harbor,
 		if err := notify.SendFeishuCard(hook, card); err != nil {
 			r.State, r.ErrMsg = "failed", err.Error()
 			logx.Warn("webhook", "notify_failed", map[string]any{"channel": ch.Name, "err": err.Error()})
+		} else {
+			sent = true
 		}
 		_ = s.St.SaveNotifyRecord(ctx, r)
+	}
+
+	// 🔴 一条都没发出去就把占位还回去，让采集器那条兜底路径还能补 ——
+	//    "webhook 发失败"正是兜底存在的全部理由。
+	if !sent {
+		_ = s.St.ReleaseNotifyClaim(ctx, p.Ref, n.ExecID)
+		if !tried {
+			rec.State = "failed"
+			rec.ErrMsg = "没有配置任何通知渠道（或渠道绑的平台对不上这条规则），消息未送出"
+			_ = s.St.SaveNotifyRecord(ctx, rec)
+		}
 	}
 }
 

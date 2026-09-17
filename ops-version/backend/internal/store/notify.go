@@ -144,6 +144,55 @@ func (s *Store) SaveNotifyRecord(ctx context.Context, in NotifyRecordInput) erro
 	return err
 }
 
+// ClaimNotify 抢这次执行的通知权。抢到返回 true，只有抢到的人才发。
+//
+// 🔴 **必须是原子的**：execution 转终态的那一刻，排队中的多个 webhook 事件会
+// 同时看到"已终态"，"先查 AlreadyNotified 再发"挡不住 —— 两个请求都查到"没发过"，
+// 于是发两张。这里靠主键冲突互斥，数据库替我们做判断。
+//
+// ⚠️ 抢到之后发失败，必须 ReleaseNotifyClaim 还回去，否则采集器那条兜底路径
+// 永远补不了这次执行。
+func (s *Store) ClaimNotify(ctx context.Context, policyRef, execID int64, by string) (bool, error) {
+	if policyRef <= 0 || execID <= 0 {
+		// execID 拿不到时不占位也不去重 —— 0 不是一个真实的 execution，
+		// 拿它当键会把所有"拿不到 id"的通知互相挡掉，表现是随机丢通知
+		return true, nil
+	}
+	res, err := s.db.ExecContext(ctx, `
+		INSERT IGNORE INTO notify_claims (policy_ref, exec_id, claimed_by) VALUES (?,?,?)`,
+		policyRef, execID, by)
+	if err != nil {
+		return false, err
+	}
+	n, err := res.RowsAffected()
+	return n == 1, err
+}
+
+// AlreadyClaimed 这次执行是不是已经有人在发（或发过）了。
+//
+// ⚠️ 只用于"要不要继续重查"这类判断，**不能**拿它替代 ClaimNotify 做去重：
+// 先查后写在并发下必然漏 —— 两个请求都查到"没人发"。
+func (s *Store) AlreadyClaimed(ctx context.Context, policyRef, execID int64) (bool, error) {
+	if policyRef <= 0 || execID <= 0 {
+		return false, nil
+	}
+	var n int
+	err := s.db.QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM notify_claims WHERE policy_ref=? AND exec_id=?`,
+		policyRef, execID).Scan(&n)
+	return n > 0, err
+}
+
+// ReleaseNotifyClaim 把占位还回去 —— 只在**一条都没发出去**时调用。
+func (s *Store) ReleaseNotifyClaim(ctx context.Context, policyRef, execID int64) error {
+	if policyRef <= 0 || execID <= 0 {
+		return nil
+	}
+	_, err := s.db.ExecContext(ctx,
+		`DELETE FROM notify_claims WHERE policy_ref=? AND exec_id=?`, policyRef, execID)
+	return err
+}
+
 // AlreadyNotified 这条规则的这次 execution 是不是已经成功通知过了。
 //
 // 🔴 只认 state='sent'。skipped（判定不该发）和 failed（该发没发出去）都不算 ——

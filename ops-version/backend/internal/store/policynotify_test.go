@@ -4,6 +4,8 @@ import (
 	"context"
 	"database/sql"
 	"os"
+	"sync"
+	"sync/atomic"
 	"testing"
 
 	"ops-version-backend/providers"
@@ -172,5 +174,91 @@ func TestZeroExecIDNeverDedups(t *testing.T) {
 	}
 	if done, _ := s.AlreadyNotified(ctx, ref, 0); done {
 		t.Error("execution id 为 0 时不能去重")
+	}
+}
+
+/*
+🔴🔴 一次执行只允许一个人发卡 —— 而且必须扛得住**并发**。
+
+Harbor 每推一个镜像发一次 webhook。execution 转终态的那一刻，
+排队中的剩余事件会同时看到"已终态"，于是同时去发。
+"先查 AlreadyNotified 再发"在这里必然漏：两个请求都查到"没发过"。
+
+这条测试用 20 个 goroutine 同时抢，断言**恰好一个**抢到。
+*/
+func TestClaimNotifyIsAtomicUnderConcurrency(t *testing.T) {
+	s, ctx, harborID := notifyTestDB(t)
+	if err := s.SavePolicies(ctx, harborID, []providers.SyncPolicy{{
+		PolicyID: 999105, Name: "zz-sync-claim", DestRegistry: "https://registry.example.com",
+		TriggerType: "manual", Enabled: true,
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	ref, _ := s.PolicyRefOf(ctx, harborID, 999105)
+	t.Cleanup(func() { _ = s.ReleaseNotifyClaim(ctx, ref, 22204) })
+
+	const n = 20
+	var wg sync.WaitGroup
+	var won int64
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if got, err := s.ClaimNotify(ctx, ref, 22204, "webhook"); err == nil && got {
+				atomic.AddInt64(&won, 1)
+			}
+		}()
+	}
+	wg.Wait()
+	if won != 1 {
+		t.Errorf("%d 个并发只该有 1 个抢到通知权，实得 %d —— 意味着一次同步会发 %d 张卡", n, won, won)
+	}
+}
+
+/*
+🔴 发送失败要把占位还回去，否则采集器那条兜底路径永远补不了这次执行 ——
+而"webhook 发失败"恰恰是兜底存在的全部理由。
+*/
+func TestReleasedClaimCanBeRetaken(t *testing.T) {
+	s, ctx, harborID := notifyTestDB(t)
+	if err := s.SavePolicies(ctx, harborID, []providers.SyncPolicy{{
+		PolicyID: 999106, Name: "zz-sync-release", DestRegistry: "https://registry.example.com",
+		TriggerType: "manual", Enabled: true,
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	ref, _ := s.PolicyRefOf(ctx, harborID, 999106)
+	t.Cleanup(func() { _ = s.ReleaseNotifyClaim(ctx, ref, 22205) })
+
+	if got, _ := s.ClaimNotify(ctx, ref, 22205, "webhook"); !got {
+		t.Fatal("第一次应该抢到")
+	}
+	if got, _ := s.ClaimNotify(ctx, ref, 22205, "collector"); got {
+		t.Fatal("没释放之前别人不该抢到")
+	}
+	// webhook 一条都没发出去 → 归还
+	if err := s.ReleaseNotifyClaim(ctx, ref, 22205); err != nil {
+		t.Fatal(err)
+	}
+	if got, _ := s.ClaimNotify(ctx, ref, 22205, "collector"); !got {
+		t.Error("归还之后采集器必须能补发，否则这次同步永远没通知")
+	}
+}
+
+// execID 为 0（Harbor 没给）时不占位也不去重 —— 拿 0 当键会把所有
+// "拿不到 id"的通知互相挡掉，表现是随机丢通知
+func TestZeroExecIDAlwaysClaims(t *testing.T) {
+	s, ctx, harborID := notifyTestDB(t)
+	if err := s.SavePolicies(ctx, harborID, []providers.SyncPolicy{{
+		PolicyID: 999107, Name: "zz-sync-zero", DestRegistry: "https://registry.example.com",
+		TriggerType: "manual", Enabled: true,
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	ref, _ := s.PolicyRefOf(ctx, harborID, 999107)
+	for i := 0; i < 3; i++ {
+		if got, err := s.ClaimNotify(ctx, ref, 0, "webhook"); err != nil || !got {
+			t.Errorf("execID=0 时每次都该放行（不去重），第 %d 次 got=%v err=%v", i+1, got, err)
+		}
 	}
 }

@@ -422,7 +422,7 @@
   },
   "notify": {
     "title": "Notification channels",
-    "hint": "Failures always notify; manual success notifies; automatic success is recorded only (so failures do not drown in noise)",
+    "hint": "Whether to notify is decided per replication policy above: enabled policies notify on both success and failure, disabled ones never notify. This section only configures where messages go",
     "add": "Add channel",
     "channel": "Channel",
     "name": "Name",
