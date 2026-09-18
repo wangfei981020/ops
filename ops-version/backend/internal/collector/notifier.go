@@ -2,6 +2,7 @@ package collector
 
 import (
 	"context"
+	"strings"
 	"time"
 
 	"ops-version-backend/internal/metrics"
@@ -87,15 +88,45 @@ func (c *Collector) notifyExecution(ctx context.Context, execRef int64, p store.
 	// 耗时与 webhook 那条路同一个口径（终态时 Harbor 没写 end_time 就用现在时刻估，标 ≈）
 	rep.Duration, rep.Approx = notify.DurationOf(e.StartedAt, e.EndedAt, time.Now(),
 		providers.IsSucceeded(e.Status) || providers.IsFailed(e.Status))
-	for _, t := range tasks {
-		im := notify.Image{Service: t.ServiceKey, Tag: t.Tag}
-		if providers.IsFailed(t.Status) {
-			im.Reason = t.ErrMsg
+	// 🔴 镜像明细**先读库**：webhook 每个事件到达时趁热存下的那份一定带版本号，
+	//    而这里手上的 tasks 是轮询时从 Harbor 拉的 —— Harbor 的 task.resource
+	//    过一会儿就变 null，轮询拿到的基本全是没有版本号的空壳。
+	//
+	//    所以 webhook 到达过（哪怕通知没发出去）的执行，补发的卡片照样有版本号。
+	seen := map[string]bool{}
+	appendImage := func(service, tag, status, errMsg string) {
+		if seen[service] {
+			return
+		}
+		seen[service] = true
+		im := notify.Image{Service: service, Tag: tag}
+		if providers.IsFailed(status) {
+			im.Reason = errMsg
 			rep.Bad = append(rep.Bad, im)
 		} else {
 			rep.OK = append(rep.OK, im)
 		}
 	}
+	saved, err := c.st.TasksOfExecution(ctx, p.Ref, e.ExecID)
+	if err != nil {
+		logx.Warn("notify", "tasks_of_execution_failed", map[string]any{
+			"exec": e.ExecID, "err": err.Error()})
+	}
+	for _, t := range saved {
+		appendImage(t.ServiceKey, t.Tag, t.Status, t.ErrMsg)
+	}
+	fromDB := len(seen)
+	for _, t := range tasks {
+		// ⚠️ 补进来的只收带版本号的：一条没有版本号的记录，读的人分不清
+		//    是"没推过去"还是"我们没拿到"。
+		if strings.TrimSpace(t.Tag) == "" {
+			continue
+		}
+		appendImage(t.ServiceKey, t.Tag, t.Status, t.ErrMsg)
+	}
+	logx.Info("notify", "card_images", map[string]any{
+		"exec": e.ExecID, "from_db": fromDB, "from_api": len(seen) - fromDB,
+		"note": "版本号以库里（webhook 趁热存的）为准，轮询拿到的只补缺"})
 	text := notify.Text(rep)
 	card := notify.Card(rep)
 	rec.Content = text

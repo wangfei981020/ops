@@ -97,6 +97,10 @@ type WebhookSyncTask struct {
 	FinishedAt time.Time
 	// TaskID Harbor 的 task id。只有回查 API 那条路径才有 ——
 	// webhook payload 里的 artifact 不带它。失败原因要靠它去拉日志。
+	//
+	// scan:skip 不从库里来：sync_tasks 没有这一列，也不需要有 ——
+	// 它只在"收到事件的当下回查 Harbor"那一小段时间里有用（拿失败日志），
+	// 落库之后再也用不上，存了反而会让人以为可以事后拿它去查。
 	TaskID int64
 	// ErrMsg 失败原因（Harbor task 日志，已截断）。空 = 成功，或没去拉。
 	ErrMsg string
@@ -109,11 +113,20 @@ type WebhookSyncTask struct {
 //	poll    轮询 REST API 拿的 —— **没有版本号**（Harbor 那个接口不给）
 //	webhook 事件推来的         —— 有版本号，对账归因靠的就是它
 //
-// ⚠️ exec_id 填 0：webhook payload 里没有执行号。
+// 🔴 **exec_id 必须落库**（2026-09-18 修）。原来这里写死 0。
 //
-//	唯一键 (policy_ref, exec_id, service_key, tag) 因此退化成
-//	(策略, 服务, 版本) —— 同一个版本推多次只留一条，幂等天然成立，
-//	Harbor 重发也不会翻倍。
+//	版本号只有在**事件到达的当下**拿得到 —— Harbor 的 task.resource
+//	过一会儿就变 null。而卡片改成"按执行汇总"之后，发卡时才去问 Harbor 要
+//	明细，那时候版本号已经没了，于是整张卡全是「未取到版本号」。
+//
+//	事件到达时这里本来就把版本号存下来了，只是没记是哪次 execution，
+//	汇总时想取也取不出来。记上 exec_id 之后，汇总直接读本表即可（见
+//	TasksOfExecution），**不用再问 Harbor**。
+//
+// ⚠️ 唯一键 (policy_ref, exec_id, service_key, tag) 仍然保证幂等：
+//
+//	同一次执行里同一个版本重复推送只留一条，Harbor 重发也不会翻倍；
+//	不同执行推同一个版本会各留一条 —— 那本来就是两次不同的复制。
 //
 // ⚠️ 策略名对不上时返回 0 而不是报错：Harbor 那边改过策略名、
 //
@@ -125,7 +138,7 @@ type WebhookSyncTask struct {
 // 🔴 ref 必须回给调用方：通知要不要发，取决于**那条规则**的通知开关，
 // 而这里是整条链路上唯一一处知道是哪条规则的地方。
 func (s *Store) SaveWebhookSyncTasks(ctx context.Context, policyName, destEndpoint, srcProject string,
-	list []WebhookSyncTask,
+	execID int64, list []WebhookSyncTask,
 ) (saved int, ref int64, matchedBy string, err error) {
 	if len(list) == 0 {
 		return 0, 0, "", nil
@@ -138,10 +151,10 @@ func (s *Store) SaveWebhookSyncTasks(ctx context.Context, policyName, destEndpoi
 	for _, t := range list {
 		if _, err := s.db.ExecContext(ctx, `
 			INSERT INTO sync_tasks (policy_ref, exec_id, service_key, tag, status, err_msg, finished_at, source)
-			VALUES (?,0,?,?,?,?,?, 'webhook')
+			VALUES (?,?,?,?,?,?,?, 'webhook')
 			ON DUPLICATE KEY UPDATE status=VALUES(status), err_msg=VALUES(err_msg),
 			  finished_at=VALUES(finished_at), source='webhook'`,
-			ref, t.ServiceKey, t.Tag, t.Status, truncate(t.ErrMsg, 500),
+			ref, execID, t.ServiceKey, t.Tag, t.Status, truncate(t.ErrMsg, 500),
 			nullIfZero(t.FinishedAt)); err != nil {
 			return n, ref, matchedBy, err
 		}
@@ -242,4 +255,41 @@ func (s *Store) resolvePolicy(ctx context.Context, policyName, destEndpoint, src
 	default:
 		return firstID, "dest_registry", nil
 	}
+}
+
+// TasksOfExecution 取这次执行已经落库的镜像明细。
+//
+// 🔴 **汇总卡片的版本号从这里来，不去问 Harbor。**
+//
+// 版本号只在复制刚结束的那一小段时间里能从 Harbor 拿到（task.resource 过后变 null）。
+// 而 webhook 是**每推一个镜像来一次**，每次到达时我们都已经趁热把版本号存进来了 ——
+// 等到整次执行结束要发卡时，库里本来就有全套，再去问 Harbor 只会拿到一堆空的。
+//
+// ⚠️ 只回有版本号的行（落库时就不收空的），所以调用方拿到的每一条都带 tag。
+func (s *Store) TasksOfExecution(ctx context.Context, policyRef, execID int64) ([]WebhookSyncTask, error) {
+	if policyRef <= 0 || execID <= 0 {
+		return nil, nil
+	}
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT service_key, tag, status, COALESCE(err_msg,''), finished_at
+		  FROM sync_tasks
+		 WHERE policy_ref=? AND exec_id=?
+		 ORDER BY id`, policyRef, execID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []WebhookSyncTask{}
+	for rows.Next() {
+		var t WebhookSyncTask
+		var fin sql.NullTime
+		if err := rows.Scan(&t.ServiceKey, &t.Tag, &t.Status, &t.ErrMsg, &fin); err != nil {
+			return nil, err
+		}
+		if fin.Valid {
+			t.FinishedAt = fin.Time
+		}
+		out = append(out, t)
+	}
+	return out, rows.Err()
 }

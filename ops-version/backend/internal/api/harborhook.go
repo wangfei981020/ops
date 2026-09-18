@@ -350,7 +350,8 @@ func (s *Server) harborHook(w http.ResponseWriter, r *http.Request) {
 	if srcProject == "" && rep.SrcResource != nil {
 		srcProject = rep.SrcResource.Namespace
 	}
-	saved, policyRef, matchedBy, err := s.St.SaveWebhookSyncTasks(r.Context(), policyName, destEndpoint, srcProject, rows)
+	saved, policyRef, matchedBy, err := s.St.SaveWebhookSyncTasks(r.Context(), policyName,
+		destEndpoint, srcProject, rep.ExecutionID, rows)
 	if err != nil {
 		// 🔴 存不进去要**明说**并返回非 2xx？不 —— Harbor 不重发，返回 5xx 只是让它记一条失败。
 		//    但日志必须是 ERROR：这条链路断了的表现是「同步状态一直是未知」，
@@ -565,8 +566,15 @@ func (s *Server) notifyIfTerminal(ctx context.Context, hb *providers.Harbor,
 		return
 	}
 
-	// 汇总：镜像明细取这次 execution 的**全部** task，而不是本次事件那一个
-	all := s.tasksAtWebhookTime(ctx, hb, n.ExecID, n.At)
+	// 🔴 汇总的镜像明细**从我们自己的库里取**，不去问 Harbor。
+	//
+	//    版本号只在复制刚结束的一小段时间里能从 Harbor 拿到（task.resource 过后变 null）。
+	//    而 webhook 是每推一个镜像来一次，每次到达时我们都已经趁热把版本号落库了 ——
+	//    等整次执行结束再去问 Harbor，拿回来的是一堆没有版本号的空壳。
+	//
+	//    这正是 v0.74.0 发出去的卡片整片「未取到版本号」的原因：
+	//    我把手里现成的东西扔了，转头去问一个已经答不上来的人。
+	all := s.mergedTasks(ctx, hb, p.Ref, n)
 	base := notify.Replication{
 		Total: e.Total, Succeeded: e.Succeeded, Failed: e.Failed,
 	}
@@ -584,6 +592,42 @@ func (s *Server) notifyIfTerminal(ctx context.Context, hb *providers.Harbor,
 	}
 	n.JobStatus = e.Status
 	s.sendReplicationCard(ctx, p, n, all, base, "该规则已开启通知；这次执行已结束，汇总发送", true)
+}
+
+// mergedTasks 这次执行要列进卡片的镜像明细。
+//
+// 顺序是**先库后 API**，不是反过来：
+//
+//	库里的 —— webhook 每个事件到达时趁热存的，**一定带版本号**
+//	API 的 —— 只有复制刚结束那会儿才带版本号，过后全是空的
+//
+// API 只用来补库里没有的服务（比如某个事件在网络上丢了），而且**只收带版本号的**：
+// 补一条没有版本号的进去，读的人分不清是"没推过去"还是"我们没拿到"。
+func (s *Server) mergedTasks(ctx context.Context, hb *providers.Harbor,
+	policyRef int64, n replicationNotice,
+) []store.WebhookSyncTask {
+	saved, err := s.St.TasksOfExecution(ctx, policyRef, n.ExecID)
+	if err != nil {
+		logx.Warn("webhook", "tasks_of_execution_failed", map[string]any{
+			"exec_id": n.ExecID, "err": err.Error()})
+	}
+	seen := map[string]bool{}
+	for _, t := range saved {
+		seen[t.ServiceKey] = true
+	}
+	added := 0
+	for _, t := range s.tasksAtWebhookTime(ctx, hb, n.ExecID, n.At) {
+		if seen[t.ServiceKey] || strings.TrimSpace(t.Tag) == "" {
+			continue
+		}
+		saved = append(saved, t)
+		seen[t.ServiceKey] = true
+		added++
+	}
+	logx.Info("webhook", "card_images", map[string]any{
+		"exec_id": n.ExecID, "from_db": len(saved) - added, "from_api": added,
+		"note": "版本号以库里（webhook 趁热存的）为准，API 只补缺"})
+	return saved
 }
 
 // recheckLater 隔几秒再查一次 execution，直到终态或者试完。

@@ -262,3 +262,79 @@ func TestZeroExecIDAlwaysClaims(t *testing.T) {
 		}
 	}
 }
+
+/*
+🔴🔴 回归：webhook 趁热存下的版本号，汇总发卡时必须读得回来。
+
+v0.74.0 的线上事故就是这条断了 —— 卡片改成"按执行汇总"后，发卡时才去问
+Harbor 要明细，而 Harbor 的 task.resource 过一会儿就变 null，
+于是整张卡 19 个镜像全是「未取到版本号」，而用户升级前每张卡都有版本号。
+
+版本号只有**事件到达的那一刻**拿得到。事件到达时本来就落库了，
+以前却没记是哪次 execution（exec_id 写死 0），想取也取不出来。
+*/
+func TestWebhookTagsAreReadableByExecution(t *testing.T) {
+	s, ctx, harborID := notifyTestDB(t)
+	if err := s.SavePolicies(ctx, harborID, []providers.SyncPolicy{{
+		PolicyID: 999108, Name: "zz-sync-tags", DestRegistry: "https://registry.example.com",
+		SrcProject: "appA", TriggerType: "manual", Enabled: true,
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	ref, _ := s.PolicyRefOf(ctx, harborID, 999108)
+	t.Cleanup(func() { s.db.Exec(`DELETE FROM sync_tasks WHERE policy_ref=?`, ref) })
+
+	// Harbor 每推一个镜像来一次事件，每次只带一个镜像 —— 模拟三次
+	for i, svc := range []string{"appA-wallet-backend", "appA-bi-frontend", "appA-gateway"} {
+		saved, gotRef, _, err := s.SaveWebhookSyncTasks(ctx, "zz-sync-tags",
+			"https://registry.example.com", "appA", 22253, []WebhookSyncTask{{
+				ServiceKey: svc, Tag: "20260918-" + string(rune('1'+i)), Status: "Succeed",
+			}})
+		if err != nil || saved != 1 || gotRef != ref {
+			t.Fatalf("第 %d 个事件落库失败：saved=%d ref=%d err=%v", i+1, saved, gotRef, err)
+		}
+	}
+
+	// 整次执行结束，汇总发卡 —— 这时 Harbor 那边的版本号已经没了，只能读库
+	rows, err := s.TasksOfExecution(ctx, ref, 22253)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 3 {
+		t.Fatalf("汇总应读回 3 条，实得 %d —— 卡片上就会缺镜像", len(rows))
+	}
+	for _, r := range rows {
+		if r.Tag == "" {
+			t.Errorf("%s 读回来没有版本号 —— 卡片上会显示「未取到版本号」", r.ServiceKey)
+		}
+	}
+	// 另一次执行不该混进来
+	if other, _ := s.TasksOfExecution(ctx, ref, 22254); len(other) != 0 {
+		t.Errorf("不同 execution 的明细不能串：实得 %d 条", len(other))
+	}
+}
+
+// 同一次执行里重复推同一个版本（Harbor 重发）只留一条，卡片上不能出现两遍
+func TestWebhookSameTagIsIdempotent(t *testing.T) {
+	s, ctx, harborID := notifyTestDB(t)
+	if err := s.SavePolicies(ctx, harborID, []providers.SyncPolicy{{
+		PolicyID: 999109, Name: "zz-sync-dup", DestRegistry: "https://registry.example.com",
+		SrcProject: "appA", TriggerType: "manual", Enabled: true,
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	ref, _ := s.PolicyRefOf(ctx, harborID, 999109)
+	t.Cleanup(func() { s.db.Exec(`DELETE FROM sync_tasks WHERE policy_ref=?`, ref) })
+
+	row := []WebhookSyncTask{{ServiceKey: "appA-wallet-backend", Tag: "t-8", Status: "Succeed"}}
+	for i := 0; i < 3; i++ {
+		if _, _, _, err := s.SaveWebhookSyncTasks(ctx, "zz-sync-dup",
+			"https://registry.example.com", "appA", 22260, row); err != nil {
+			t.Fatal(err)
+		}
+	}
+	rows, _ := s.TasksOfExecution(ctx, ref, 22260)
+	if len(rows) != 1 {
+		t.Errorf("同一次执行重复推同一个版本应只留一条，实得 %d", len(rows))
+	}
+}
