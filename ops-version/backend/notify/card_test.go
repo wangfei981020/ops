@@ -2,6 +2,7 @@ package notify
 
 import (
 	"encoding/json"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -110,29 +111,145 @@ func TestFailuresListedFirst(t *testing.T) {
 }
 
 /*
-截断要说清「共几个、还剩几个没列」。
+🔴 不再截断：一次同步 19 个镜像就要列出 19 个。
 
-老脚本恒写「（前10个）」：1 个镜像时看着莫名其妙，19 个时又看不出漏了多少 ——
-而"少推的那一个"正是对账要问的。
+用户 2026-09-18 的要求：「全部同步的你要全部发出来，不然查询版本号不好查」。
+原来写死列 10 个，19 个的时候少看 9 个 —— 而那份完整清单正是通知的用处。
 */
-func TestTruncationStatesTotals(t *testing.T) {
+func TestSinglePageListsEverything(t *testing.T) {
 	r := sample()
 	r.OK = nil
 	for i := 0; i < 19; i++ {
-		r.OK = append(r.OK, Image{Service: "svc", Tag: "t"})
+		r.OK = append(r.OK, Image{Service: fmt.Sprintf("svc-%02d", i), Tag: fmt.Sprintf("t-%02d", i)})
 	}
 	r.Succeeded, r.Total = 19, 19
-	got := Text(r)
-	if !strings.Contains(got, "共 19 个") || !strings.Contains(got, "前 10 个") {
-		t.Errorf("截断时要说明总数和列出条数：\n%s", got)
+	pages := Split(r)
+	if len(pages) != 1 {
+		t.Fatalf("19 个镜像应该一张卡装下，实得 %d 张", len(pages))
 	}
-	if !strings.Contains(got, "其余 9 个未列出") {
-		t.Errorf("要说明还剩多少没列：\n%s", got)
+	got := Text(pages[0])
+	if strings.Contains(got, "未列出") || strings.Contains(got, "前 10 个") {
+		t.Errorf("不该再有截断字样：\n%s", got)
 	}
-	// 没超过上限时不该出现「前 10 个」这种将就说法
-	small := sample()
-	if s := Text(small); strings.Contains(s, "前 10 个") {
-		t.Errorf("只有 1 个镜像时不该写「前 10 个」：\n%s", s)
+	for i := 0; i < 19; i++ {
+		if !strings.Contains(got, fmt.Sprintf("t-%02d", i)) {
+			t.Errorf("缺第 %d 个镜像的版本号：\n%s", i, got)
+		}
+	}
+	// 单片不显示「(1/1)」，那是噪音
+	if strings.Contains(got, "(1/1)") {
+		t.Errorf("单片不该显示页码：\n%s", got)
+	}
+}
+
+/*
+100 个镜像 → 4 片，每片 25 个，合起来一个不少；页码和序号区间都要对。
+*/
+func TestHundredImagesSplitIntoPages(t *testing.T) {
+	r := sample()
+	r.OK = nil
+	for i := 0; i < 100; i++ {
+		r.OK = append(r.OK, Image{Service: fmt.Sprintf("svc-%03d", i), Tag: fmt.Sprintf("t-%03d", i)})
+	}
+	r.Succeeded, r.Total = 100, 100
+	pages := Split(r)
+	if len(pages) != 4 {
+		t.Fatalf("100 个镜像按每片 25 个应切成 4 片，实得 %d", len(pages))
+	}
+	seen := 0
+	for i, p := range pages {
+		txt := Text(p)
+		if !strings.Contains(txt, fmt.Sprintf("(%d/4)", i+1)) {
+			t.Errorf("第 %d 片缺页码：\n%s", i+1, txt)
+		}
+		// 头部只在第一片
+		if i == 0 && !strings.Contains(txt, "平台") {
+			t.Errorf("第一片必须有头部：\n%s", txt)
+		}
+		if i > 0 && strings.Contains(txt, "耗时") {
+			t.Errorf("续页不该重复头部：\n%s", txt)
+		}
+		if !strings.Contains(txt, fmt.Sprintf("第 %d–%d 个", i*25+1, i*25+25)) {
+			t.Errorf("第 %d 片的序号区间不对：\n%s", i+1, txt)
+		}
+		seen += len(p.OK)
+	}
+	if seen != 100 {
+		t.Errorf("分片后镜像总数应为 100，实得 %d —— 有内容被丢了", seen)
+	}
+}
+
+/*
+🔴 超过总上限（8 片 = 200 个）时，最后一片必须说清还剩多少、去哪儿看 ——
+不能让人以为"就这么多"。
+*/
+func TestOverMaxCardsIsSpelledOut(t *testing.T) {
+	r := sample()
+	r.OK = nil
+	for i := 0; i < 250; i++ {
+		r.OK = append(r.OK, Image{Service: fmt.Sprintf("svc-%03d", i), Tag: "t"})
+	}
+	r.Succeeded, r.Total = 250, 250
+	pages := Split(r)
+	if len(pages) != 8 {
+		t.Fatalf("250 个镜像应封顶在 8 片，实得 %d", len(pages))
+	}
+	last := Text(pages[7])
+	if !strings.Contains(last, "其余 50 个未列出") || !strings.Contains(last, "Execution") {
+		t.Errorf("最后一片要说明剩多少、去哪儿看：\n%s", last)
+	}
+}
+
+/*
+🔴 失败镜像永远在第一片、永远全量，不参与分片 ——
+要处理的东西不能被翻页藏起来。
+*/
+func TestFailuresAlwaysOnFirstPage(t *testing.T) {
+	r := sample()
+	r.Level = LevelFailed
+	r.OK = nil
+	for i := 0; i < 60; i++ {
+		r.OK = append(r.OK, Image{Service: fmt.Sprintf("ok-%02d", i), Tag: "t"})
+	}
+	r.Bad = []Image{
+		{Service: "bad-wallet", Tag: "t-8", Reason: "manifest unknown"},
+		{Service: "bad-bi", Tag: "t-3", Reason: "unauthorized"},
+	}
+	r.Succeeded, r.Failed, r.Total = 60, 2, 62
+	pages := Split(r)
+	if len(pages) < 2 {
+		t.Fatalf("60 个成功镜像该分片，实得 %d", len(pages))
+	}
+	if !strings.Contains(Text(pages[0]), "bad-wallet") {
+		t.Error("失败镜像必须在第一片")
+	}
+	for i := 1; i < len(pages); i++ {
+		if strings.Contains(Text(pages[i]), "bad-wallet") {
+			t.Errorf("第 %d 片重复了失败清单", i+1)
+		}
+	}
+}
+
+/*
+🔴 单张卡序列化后必须小于飞书的 20KB 硬限制 —— 超了整条拒收，
+表现是"这一页没发出来"，比多发一页糟得多。服务名特别长时尤其危险。
+*/
+func TestNoPageExceedsFeishuLimit(t *testing.T) {
+	r := sample()
+	r.OK = nil
+	long := strings.Repeat("very-long-service-name-segment-", 8) // ~250 字节
+	for i := 0; i < 200; i++ {
+		r.OK = append(r.OK, Image{Service: fmt.Sprintf("%s-%03d", long, i), Tag: "20260918021500-40"})
+	}
+	r.Succeeded, r.Total = 200, 200
+	for i, p := range Split(r) {
+		raw, err := json.Marshal(Card(p))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(raw) > 20<<10 {
+			t.Errorf("第 %d 片 %d 字节，超过飞书 20KB 上限", i+1, len(raw))
+		}
 	}
 }
 
@@ -200,27 +317,5 @@ func TestApproxDurationIsMarked(t *testing.T) {
 	got := Text(r)
 	if !strings.Contains(got, "≈ 36 秒") {
 		t.Errorf("估算的耗时要标 ≈：\n%s", got)
-	}
-}
-
-/*
-一次同步 100 个镜像 → **一张卡**，列 10 条，并说清还有 90 条没列。
-
-Harbor 是每推一个镜像发一次 webhook，真按事件发就是 100 张卡，
-而飞书自定义机器人限频 100 次/分钟、5 次/秒 —— 必然有发不出去的。
-*/
-func TestHundredImagesStayOneCard(t *testing.T) {
-	r := sample()
-	r.OK = nil
-	for i := 0; i < 100; i++ {
-		r.OK = append(r.OK, Image{Service: "svc-" + string(rune('a'+i%26)), Tag: "20260917-1"})
-	}
-	r.Total, r.Succeeded = 100, 100
-	got := Text(r)
-	if !strings.Contains(got, "共 100 个") || !strings.Contains(got, "其余 90 个未列出") {
-		t.Errorf("100 个镜像要汇总成一张卡并说清截断：\n%s", got)
-	}
-	if n := strings.Count(got, "20260917-1"); n != 10 {
-		t.Errorf("应只列 10 条版本号，实得 %d 条", n)
 	}
 }

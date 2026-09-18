@@ -423,6 +423,10 @@ func (s *Server) harborHook(w http.ResponseWriter, r *http.Request) {
 // 交给采集器兜底就行，不值得在这里挂更久。
 var recheckDelays = []time.Duration{5 * time.Second, 15 * time.Second, 30 * time.Second}
 
+// pageInterval 分片之间的间隔。飞书自定义机器人限频 **5 次/秒**，
+// 连发会被拒收（表现是"中间少了一页"）。8 片最多多花 2.4 秒，可以接受。
+const pageInterval = 300 * time.Millisecond
+
 // replicationNotice 一次复制事件里与「要不要通知、通知什么」有关的部分。
 //
 // ⚠️ 单独一个结构体而不是一串参数：原来是 7 个位置参数、其中 4 个 string
@@ -688,11 +692,12 @@ func (s *Server) sendReplicationCard(ctx context.Context, p store.PolicyRow,
 			Service: x.ServiceKey, Tag: x.Tag, Reason: x.ErrMsg})
 	}
 
-	text := notify.Text(rep)
-	card := notify.Card(rep)
+	// 🔴 镜像多了要**分片全量发**，不截断 —— 收通知的人要的就是完整清单
+	//    （"哪个服务推到哪个版本了"）。见 notify.Split。
+	pages := notify.Split(rep)
 	rec := store.NotifyRecordInput{
 		PolicyRef: p.Ref, HarborExecID: n.ExecID, Level: string(level),
-		Trigger: n.Trigger, Reason: reason, Content: text,
+		Trigger: n.Trigger, Reason: reason,
 	}
 
 	chans, err := s.St.ListChannels(ctx)
@@ -715,17 +720,29 @@ func (s *Server) sendReplicationCard(ctx context.Context, p store.PolicyRow,
 			logx.Warn("webhook", "channel_decrypt_failed", map[string]any{"channel": ch.Name})
 			continue
 		}
-		// ⚠️ 这里原来又声明了一个局部 reason，把外层那个遮蔽掉了，
-		//    于是通知记录里的「原因」一直是空串 —— 界面上看不出这条为什么发。
-		r := rec
-		r.ChannelID, r.State, r.Attempts = ch.ID, "sent", 1
-		if err := notify.SendFeishuCard(hook, card); err != nil {
-			r.State, r.ErrMsg = "failed", err.Error()
-			logx.Warn("webhook", "notify_failed", map[string]any{"channel": ch.Name, "err": err.Error()})
-		} else {
-			sent = true
+		for i, page := range pages {
+			// ⚠️ 分片投递**不是原子的**：中间一片失败群里就缺一页。
+			//    所以每片各记一条投递记录，原因里带页码 ——
+			//    否则事后只能对着群里数，查不出缺的是哪一页。
+			r := rec
+			r.ChannelID, r.State, r.Attempts = ch.ID, "sent", 1
+			r.Content = notify.Text(page)
+			if len(pages) > 1 {
+				r.Reason = fmt.Sprintf("%s（第 %d/%d 页）", reason, i+1, len(pages))
+			}
+			if err := notify.SendFeishuCard(hook, notify.Card(page)); err != nil {
+				r.State, r.ErrMsg = "failed", err.Error()
+				logx.Warn("webhook", "notify_failed", map[string]any{
+					"channel": ch.Name, "page": i + 1, "pages": len(pages), "err": err.Error()})
+			} else {
+				sent = true
+			}
+			_ = s.St.SaveNotifyRecord(ctx, r)
+			// 飞书自定义机器人限频 5 次/秒，分片之间留出间隔
+			if i < len(pages)-1 {
+				time.Sleep(pageInterval)
+			}
 		}
-		_ = s.St.SaveNotifyRecord(ctx, r)
 	}
 
 	// 🔴 一条都没发出去就把占位还回去，让采集器那条兜底路径还能补 ——

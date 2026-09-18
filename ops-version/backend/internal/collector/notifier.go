@@ -2,6 +2,7 @@ package collector
 
 import (
 	"context"
+	"fmt"
 	"strings"
 	"time"
 
@@ -127,9 +128,8 @@ func (c *Collector) notifyExecution(ctx context.Context, execRef int64, p store.
 	logx.Info("notify", "card_images", map[string]any{
 		"exec": e.ExecID, "from_db": fromDB, "from_api": len(seen) - fromDB,
 		"note": "版本号以库里（webhook 趁热存的）为准，轮询拿到的只补缺"})
-	text := notify.Text(rep)
-	card := notify.Card(rep)
-	rec.Content = text
+	// 分片全量发，与 webhook 那条路同一套（见 notify.Split）
+	pages := notify.Split(rep)
 
 	chans, err := c.st.ListChannels(ctx)
 	if err != nil {
@@ -155,17 +155,30 @@ func (c *Collector) notifyExecution(ctx context.Context, execRef int64, p store.
 			metrics.NotifyTotal.WithLabelValues(string(level), "failed").Inc()
 			continue
 		}
-		attempts, sendErr := deliver(ctx, hook, card)
-		r.State, r.Attempts = "sent", attempts
-		if sendErr != nil {
-			r.State, r.ErrMsg = "failed", sendErr.Error()
-			logx.Warn("notify", "deliver_failed", map[string]any{
-				"channel": ch.Name, "attempts": attempts, "err": r.ErrMsg})
-		} else {
-			sent = true
+		for i, page := range pages {
+			// ⚠️ 每片各记一条，原因带页码 —— 缺页要查得出来是哪一页
+			pr := r
+			pr.Content = notify.Text(page)
+			if len(pages) > 1 {
+				pr.Reason = fmt.Sprintf("%s（第 %d/%d 页）", r.Reason, i+1, len(pages))
+			}
+			attempts, sendErr := deliver(ctx, hook, notify.Card(page))
+			pr.State, pr.Attempts = "sent", attempts
+			if sendErr != nil {
+				pr.State, pr.ErrMsg = "failed", sendErr.Error()
+				logx.Warn("notify", "deliver_failed", map[string]any{
+					"channel": ch.Name, "page": i + 1, "pages": len(pages),
+					"attempts": attempts, "err": pr.ErrMsg})
+			} else {
+				sent = true
+			}
+			_ = c.st.SaveNotifyRecord(ctx, pr)
+			metrics.NotifyTotal.WithLabelValues(string(level), pr.State).Inc()
+			// 飞书限频 5 次/秒，分片之间留间隔
+			if i < len(pages)-1 {
+				time.Sleep(pageInterval)
+			}
 		}
-		_ = c.st.SaveNotifyRecord(ctx, r)
-		metrics.NotifyTotal.WithLabelValues(string(level), r.State).Inc()
 	}
 
 	// 🔴 该发但一个渠道都没有 —— 这不是"发成功了"，也不是"不用发"。
@@ -183,6 +196,9 @@ func (c *Collector) notifyExecution(ctx context.Context, execRef int64, p store.
 		_ = c.st.ReleaseNotifyClaim(ctx, p.Ref, e.ExecID)
 	}
 }
+
+// pageInterval 分片之间的间隔（飞书限频 5 次/秒）
+const pageInterval = 300 * time.Millisecond
 
 // deliver 投递，失败重试。返回实际尝试次数。
 //
