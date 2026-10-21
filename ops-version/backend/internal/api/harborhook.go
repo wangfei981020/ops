@@ -12,6 +12,7 @@ import (
 	"strings"
 	"time"
 
+	"ops-version-backend/internal/collector"
 	"ops-version-backend/internal/imageref"
 	"ops-version-backend/internal/store"
 	"ops-version-backend/logx"
@@ -720,6 +721,7 @@ func (s *Server) sendReplicationCard(ctx context.Context, p store.PolicyRow,
 			logx.Warn("webhook", "channel_decrypt_failed", map[string]any{"channel": ch.Name})
 			continue
 		}
+		chSent := false
 		for i, page := range pages {
 			// ⚠️ 分片投递**不是原子的**：中间一片失败群里就缺一页。
 			//    所以每片各记一条投递记录，原因里带页码 ——
@@ -735,7 +737,7 @@ func (s *Server) sendReplicationCard(ctx context.Context, p store.PolicyRow,
 				logx.Warn("webhook", "notify_failed", map[string]any{
 					"channel": ch.Name, "page": i + 1, "pages": len(pages), "err": err.Error()})
 			} else {
-				sent = true
+				sent, chSent = true, true
 				if ch.Kind == notify.KindTeams {
 					// Teams 回 202 只代表工作流收下了，别和飞书的「已送达」混为一谈
 					r.Reason = r.Reason + "；" + notify.TeamsDeliveredNote
@@ -746,6 +748,10 @@ func (s *Server) sendReplicationCard(ctx context.Context, p store.PolicyRow,
 			if i < len(pages)-1 {
 				time.Sleep(pageInterval)
 			}
+		}
+		// 失败卡片全部发完，最后 @ 一次（不是每片都 @）—— 与采集器那条路同一个函数
+		if level == notify.LevelFailed && ch.Kind == notify.KindTeams && chSent {
+			collector.SendFailureMentions(ctx, s.St, ch, hook, rep, rec)
 		}
 	}
 

@@ -127,3 +127,73 @@ func TestDeliverByKind(t *testing.T) {
 		t.Error("ValidKind 不对")
 	}
 }
+
+func TestTeamsAccountValidation(t *testing.T) {
+	if got := NormalizeTeamsAccount("  Alice@Example.COM​ "); got != "alice@example.com" {
+		t.Fatalf("normalize: %q", got)
+	}
+	for _, ok := range []string{"alice@example.com", "a.b-c_d@sub.example.co"} {
+		if !ValidTeamsAccount(ok) {
+			t.Errorf("应接受 %q", ok)
+		}
+	}
+	for _, bad := range []string{"", "alice", "alice@", "@example.com", "alice@localhost", "a b@example.com"} {
+		if ValidTeamsAccount(bad) {
+			t.Errorf("应拒绝 %q", bad)
+		}
+	}
+	if ValidMentionName("a<b") || ValidMentionName("") || !ValidMentionName("张三") {
+		t.Error("名字校验不对")
+	}
+}
+
+func TestTeamsMentionCard(t *testing.T) {
+	ms := []TeamsMention{
+		{Name: "Alice", Account: "alice@example.com"},
+		{Name: "Bob", Account: "bob@example.com"},
+		{Name: "重复", Account: "alice@example.com"}, // 同一账号只 @ 一次
+	}
+	b := TeamsMentionCard(Replication{Policy: "p1", ExecID: 42, Level: LevelFailed}, ms)
+	s := string(b)
+	// <at> 不能被转义成 \u003c，否则 Teams 不认
+	if strings.Contains(s, `\u003c`) {
+		t.Fatal("<at> 被 HTML 转义了")
+	}
+	var v struct {
+		Attachments []struct {
+			Content struct {
+				MSTeams struct {
+					Entities []struct {
+						Text      string `json:"text"`
+						Mentioned struct {
+							ID   string `json:"id"`
+							Name string `json:"name"`
+						} `json:"mentioned"`
+					} `json:"entities"`
+				} `json:"msteams"`
+				Body []struct {
+					Text string `json:"text"`
+				} `json:"body"`
+			} `json:"content"`
+		} `json:"attachments"`
+	}
+	if err := json.Unmarshal(b, &v); err != nil {
+		t.Fatal(err)
+	}
+	c := v.Attachments[0].Content
+	if len(c.MSTeams.Entities) != 2 {
+		t.Fatalf("entities = %d，想要 2（重复账号去掉）", len(c.MSTeams.Entities))
+	}
+	if e := c.MSTeams.Entities[1]; e.Text != "<at>Bob</at>" || e.Mentioned.ID != "bob@example.com" {
+		t.Fatalf("entity 不对: %+v", e)
+	}
+	if !strings.Contains(c.Body[0].Text, "p1") || !strings.Contains(c.Body[0].Text, "42") {
+		t.Fatalf("标题缺规则名或 Execution: %q", c.Body[0].Text)
+	}
+	if c.Body[1].Text != "<at>Alice</at>  <at>Bob</at>" {
+		t.Fatalf("@ 行: %q", c.Body[1].Text)
+	}
+	if got := TeamsMentionLog(ms[:2]); got != "@ Alice(alice@example.com) Bob(bob@example.com)" {
+		t.Fatalf("log: %q", got)
+	}
+}

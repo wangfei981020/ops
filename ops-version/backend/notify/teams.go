@@ -8,6 +8,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"regexp"
 	"strings"
 	"unicode"
 )
@@ -260,4 +261,87 @@ func SendTest(kind, webhook, channel string) error {
 		return SendTeams(webhook, TeamsTestCard(channel))
 	}
 	return SendFeishu(webhook, "【OpsVersion】测试消息：通知渠道「"+channel+"」配置正常")
+}
+
+// ─────────────── 同步失败时 @ 人（只有 Teams） ───────────────
+//
+// 🔴 @ 不放进失败卡片本身，而是失败卡片发完之后**另发一条**小卡片：
+// 工作流只回 202、不告诉你账号存不存在；账号填错时 Teams 静默丢掉这个人，
+// 同一张卡片里其他人的名字还会跟着错位（日志告警那边实际出过）。
+// 分开发，账号错了最多影响这条提醒，失败告警本身照样送达。
+
+// TeamsMention 一个要 @ 的人。Account 是 Teams 登录账号（一般是公司邮箱）。
+type TeamsMention struct {
+	Name    string
+	Account string
+}
+
+var teamsAccountRe = regexp.MustCompile(`^[a-z0-9][a-z0-9._%+-]{0,63}@[a-z0-9](?:[a-z0-9-]{0,62}[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]{0,62}[a-z0-9])?)+$`)
+
+// NormalizeTeamsAccount 去空白（含复制带进来的不可见字符）并转小写。
+func NormalizeTeamsAccount(s string) string {
+	return strings.ToLower(NormalizeTeamsWebhook(s))
+}
+
+// ValidTeamsAccount 账号格式像不像登录地址（不代表账号存在）。调用前先 Normalize。
+func ValidTeamsAccount(s string) bool { return len(s) <= 254 && teamsAccountRe.MatchString(s) }
+
+// ValidMentionName 卡片上 @ 显示的名字：不能带 < >（会破坏 <at> 标记）。
+func ValidMentionName(s string) bool {
+	return s != "" && len([]rune(s)) <= 64 && !strings.ContainsAny(s, "<>")
+}
+
+// TeamsMentionLog 写进投递记录的 @ 明细：有人说没被提醒时，对照用的是哪个账号。
+func TeamsMentionLog(ms []TeamsMention) string {
+	parts := make([]string, 0, len(ms))
+	for _, m := range ms {
+		parts = append(parts, fmt.Sprintf("%s(%s)", m.Name, m.Account))
+	}
+	return "@ " + strings.Join(parts, " ")
+}
+
+// TeamsMentionCard 同步失败后追发的 @ 提醒。
+func TeamsMentionCard(r Replication, ms []TeamsMention) []byte {
+	head := "‼️ 镜像同步失败，请查看上一条 · " + r.Policy
+	if r.ExecID > 0 {
+		head += fmt.Sprintf("（Execution %d）", r.ExecID)
+	}
+	return mentionCard(head, ms)
+}
+
+// TeamsMentionTestCard 渠道「测试」时追发的 @ 提醒，和真实提醒同一种卡片。
+func TeamsMentionTestCard(channel string, ms []TeamsMention) []byte {
+	return mentionCard("【OpsVersion】测试 @ 提醒 · 渠道「"+channel+"」：名字高亮 = 账号正确，黑字 = 账号不对", ms)
+}
+
+func mentionCard(head string, ms []TeamsMention) []byte {
+	tags := make([]string, 0, len(ms))
+	entities := make([]any, 0, len(ms))
+	seen := map[string]bool{}
+	for _, m := range ms {
+		if m.Account == "" || seen[m.Account] {
+			continue
+		}
+		seen[m.Account] = true
+		tag := "<at>" + m.Name + "</at>"
+		tags = append(tags, tag)
+		entities = append(entities, map[string]any{
+			"type": "mention", "text": tag,
+			"mentioned": map[string]any{"id": m.Account, "name": m.Name},
+		})
+	}
+	return marshalNoEscape(map[string]any{
+		"type": "message",
+		"attachments": []any{map[string]any{
+			"contentType": "application/vnd.microsoft.card.adaptive", "contentUrl": nil,
+			"content": map[string]any{
+				"type": "AdaptiveCard", "$schema": "http://adaptivecards.io/schemas/adaptive-card.json",
+				"version": "1.4", "msteams": map[string]any{"width": "Full", "entities": entities},
+				"body": []any{
+					map[string]any{"type": "TextBlock", "text": head, "wrap": true, "weight": "Bolder", "color": "Attention"},
+					map[string]any{"type": "TextBlock", "text": strings.Join(tags, "  "), "wrap": true, "spacing": "Small"},
+				},
+			},
+		}},
+	})
 }

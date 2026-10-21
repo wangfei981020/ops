@@ -40,6 +40,8 @@ func friendlyDBErr(err error) error {
 			return fmt.Errorf("角色码已存在")
 		case strings.Contains(me.Message, "uk_alive_username"):
 			return fmt.Errorf("用户名已存在")
+		case strings.Contains(me.Message, "uk_contact_account"):
+			return fmt.Errorf("这个 Teams 账号已经有通知人了")
 		}
 		return fmt.Errorf("有重复的记录：%s", me.Message)
 	case 1452: // 外键约束

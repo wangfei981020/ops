@@ -86,6 +86,19 @@ export interface Channel {
   enabled: boolean
   org_id: number | null
   org_name: string
+  /** 同步失败时 @ 的通知人 id（只对 Teams 渠道生效；含已停用的人） */
+  mention_ids: number[] | null
+}
+
+/** 通知人：Teams 渠道同步失败时 @ 的人 */
+export interface Contact {
+  id: number
+  name: string
+  teams_account: string
+  note: string
+  enabled: boolean
+  /** 被几个渠道勾选 */
+  channels: number
 }
 
 export interface NotifyRecord {

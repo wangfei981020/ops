@@ -155,6 +155,7 @@ func (c *Collector) notifyExecution(ctx context.Context, execRef int64, p store.
 			metrics.NotifyTotal.WithLabelValues(string(level), "failed").Inc()
 			continue
 		}
+		chSent := false
 		for i, page := range pages {
 			// ⚠️ 每片各记一条，原因带页码 —— 缺页要查得出来是哪一页
 			pr := r
@@ -174,7 +175,7 @@ func (c *Collector) notifyExecution(ctx context.Context, execRef int64, p store.
 					"channel": ch.Name, "page": i + 1, "pages": len(pages),
 					"attempts": attempts, "err": pr.ErrMsg})
 			} else {
-				sent = true
+				sent, chSent = true, true
 			}
 			_ = c.st.SaveNotifyRecord(ctx, pr)
 			metrics.NotifyTotal.WithLabelValues(string(level), pr.State).Inc()
@@ -182,6 +183,10 @@ func (c *Collector) notifyExecution(ctx context.Context, execRef int64, p store.
 			if i < len(pages)-1 {
 				time.Sleep(pageInterval)
 			}
+		}
+		// 失败卡片全部发完，最后 @ 一次（不是每片都 @）
+		if level == notify.LevelFailed && ch.Kind == notify.KindTeams && chSent {
+			SendFailureMentions(ctx, c.st, ch, hook, rep, r)
 		}
 	}
 

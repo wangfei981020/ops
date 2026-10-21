@@ -1,6 +1,8 @@
 package api
 
 import (
+	"errors"
+	"fmt"
 	"net/http"
 	"ops-version-backend/logx"
 	"strconv"
@@ -216,6 +218,8 @@ type channelReq struct {
 	Webhook string `json:"webhook"` // 空 = 不改
 	Enabled bool   `json:"enabled"`
 	OrgID   int64  `json:"org_id"`
+	// MentionIDs 同步失败时 @ 的通知人；不传 = 不改。只有 Teams 渠道用得上
+	MentionIDs *[]int64 `json:"mention_ids"`
 }
 
 func (s *Server) listChannels(w http.ResponseWriter, r *http.Request) {
@@ -274,8 +278,17 @@ func (s *Server) saveChannel(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
+	var mentions []int64
+	if req.MentionIDs != nil {
+		mentions = append([]int64{}, *req.MentionIDs...)
+	}
+	if kind != notify.KindTeams {
+		// 飞书渠道不 @：改成飞书时把勾选清掉，免得列表上显示一份不生效的配置
+		mentions = []int64{}
+	}
 	newID, err := s.St.SaveChannel(r.Context(), id, store.ChannelInput{
 		Name: req.Name, Kind: kind, WebhookEnc: enc, Enabled: req.Enabled, OrgID: req.OrgID,
+		MentionIDs: mentions,
 	})
 	action := "notify.channel_create"
 	if id > 0 {
@@ -329,6 +342,26 @@ func (s *Server) testChannel(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	sendErr := notify.SendTest(ch.Kind, hook, ch.Name)
+	// 🔴 测试要和真实发送一致：Teams 渠道勾了通知人，就像同步失败时那样再追发一条 @ 提醒，
+	//    用来确认账号填得对不对（名字高亮 = 对，黑字 = 不对）
+	mentionNote := ""
+	if sendErr == nil && ch.Kind == notify.KindTeams {
+		contacts, err := s.St.ChannelMentions(r.Context(), ch.ID)
+		if err != nil {
+			sendErr = errors.New("读取通知人失败：" + err.Error())
+		} else if len(contacts) > 0 {
+			ms := make([]notify.TeamsMention, 0, len(contacts))
+			for _, c := range contacts {
+				ms = append(ms, notify.TeamsMention{Name: c.Name, Account: c.TeamsAccount})
+			}
+			time.Sleep(pageInterval)
+			if err := notify.SendTeams(hook, notify.TeamsMentionTestCard(ch.Name, ms)); err != nil {
+				sendErr = errors.New("测试卡片已发出，但 @ 提醒发送失败：" + err.Error())
+			} else {
+				mentionNote = fmt.Sprintf("；另发了一条 @ 提醒（%d 人），名字高亮 = 账号正确", len(ms))
+			}
+		}
+	}
 	s.St.Audit(r.Context(), userOf(r).Username, "notify.test", ch.Name, nil, sendErr, clientIP(r))
 	if sendErr != nil {
 		// 同上：通知测试失败也是 200，日志里同样会隐身
@@ -342,6 +375,7 @@ func (s *Server) testChannel(w http.ResponseWriter, r *http.Request) {
 		// 202 只代表工作流收下了，卡片之后由 Power Automate 发出
 		msg = "Teams 已接收，去群里确认是否收到卡片"
 	}
+	msg += mentionNote
 	ok(w, map[string]any{"ok": true, "message": msg})
 }
 

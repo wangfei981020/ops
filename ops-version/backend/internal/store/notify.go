@@ -14,7 +14,9 @@ type NotifyChannel struct {
 	Enabled    bool   `json:"enabled"`
 	OrgID      *int64 `json:"org_id"`
 	OrgName    string `json:"org_name"`
-	WebhookEnc string `json:"-"`
+	// MentionIDs 同步失败时 @ 的通知人（只对 Teams 渠道有意义）
+	MentionIDs []int64 `json:"mention_ids"`
+	WebhookEnc string  `json:"-"`
 }
 
 func (s *Store) ListChannels(ctx context.Context) ([]NotifyChannel, error) {
@@ -46,7 +48,20 @@ func (s *Store) ListChannels(ctx context.Context) ([]NotifyChannel, error) {
 		}
 		out = append(out, c)
 	}
-	return out, rows.Err()
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	mentions, err := s.channelMentionIDs(ctx)
+	if err != nil {
+		return nil, err
+	}
+	for i := range out {
+		out[i].MentionIDs = mentions[out[i].ID]
+		if out[i].MentionIDs == nil {
+			out[i].MentionIDs = []int64{}
+		}
+	}
+	return out, nil
 }
 
 type ChannelInput struct {
@@ -55,6 +70,8 @@ type ChannelInput struct {
 	WebhookEnc string // 空 = 不改
 	Enabled    bool
 	OrgID      int64 // 0 = 全部组织
+	// MentionIDs nil = 不改；非 nil 整体替换（空切片 = 清空）
+	MentionIDs []int64
 }
 
 func (s *Store) SaveChannel(ctx context.Context, id int64, in ChannelInput) (int64, error) {
@@ -62,15 +79,28 @@ func (s *Store) SaveChannel(ctx context.Context, id int64, in ChannelInput) (int
 	if in.OrgID > 0 {
 		org = in.OrgID
 	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return 0, err
+	}
+	defer func() { _ = tx.Rollback() }()
 	if id == 0 {
-		res, err := s.db.ExecContext(ctx, `
+		res, err := tx.ExecContext(ctx, `
 			INSERT INTO notify_channels (name, kind, webhook_enc, enabled, org_id)
 			VALUES (?,?,?,?,?)`,
 			in.Name, in.Kind, nullIfEmpty(in.WebhookEnc), boolToInt(in.Enabled), org)
 		if err != nil {
 			return 0, err
 		}
-		return res.LastInsertId()
+		if id, err = res.LastInsertId(); err != nil {
+			return 0, err
+		}
+		if in.MentionIDs != nil {
+			if err := setChannelMentions(ctx, tx, id, in.MentionIDs); err != nil {
+				return 0, err
+			}
+		}
+		return id, tx.Commit()
 	}
 	q := `UPDATE notify_channels SET name=?, kind=?, enabled=?, org_id=?`
 	args := []any{in.Name, in.Kind, boolToInt(in.Enabled), org}
@@ -81,8 +111,15 @@ func (s *Store) SaveChannel(ctx context.Context, id int64, in ChannelInput) (int
 	}
 	q += ` WHERE id=?`
 	args = append(args, id)
-	_, err := s.db.ExecContext(ctx, q, args...)
-	return id, err
+	if _, err := tx.ExecContext(ctx, q, args...); err != nil {
+		return 0, err
+	}
+	if in.MentionIDs != nil {
+		if err := setChannelMentions(ctx, tx, id, in.MentionIDs); err != nil {
+			return 0, err
+		}
+	}
+	return id, tx.Commit()
 }
 
 func (s *Store) DeleteChannel(ctx context.Context, id int64) error {

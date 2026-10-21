@@ -291,6 +291,10 @@ func (s *Server) Routes() http.Handler {
 	mux.HandleFunc("PUT /api/notify/channels/{id}", s.requires(auth.PermAlertWrite, s.saveChannel))
 	mux.HandleFunc("DELETE /api/notify/channels/{id}", s.requires(auth.PermAlertWrite, s.deleteChannel))
 	mux.HandleFunc("POST /api/notify/channels/{id}/test", s.requires(auth.PermAlertWrite, s.testChannel))
+	mux.HandleFunc("GET /api/notify/contacts", s.requires(auth.PermView, s.listContacts))
+	mux.HandleFunc("POST /api/notify/contacts", s.requires(auth.PermAlertWrite, s.saveContact))
+	mux.HandleFunc("PUT /api/notify/contacts/{id}", s.requires(auth.PermAlertWrite, s.saveContact))
+	mux.HandleFunc("DELETE /api/notify/contacts/{id}", s.requires(auth.PermAlertWrite, s.deleteContact))
 	mux.HandleFunc("GET /api/notify/records", s.requires(auth.PermView, s.listNotifyRecords))
 
 	// 镜像查询：从我方 Harbor 拿服务清单与版本，逐个判定推没推过去
