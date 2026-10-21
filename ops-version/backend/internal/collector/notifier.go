@@ -162,8 +162,12 @@ func (c *Collector) notifyExecution(ctx context.Context, execRef int64, p store.
 			if len(pages) > 1 {
 				pr.Reason = fmt.Sprintf("%s（第 %d/%d 页）", r.Reason, i+1, len(pages))
 			}
-			attempts, sendErr := deliver(ctx, hook, notify.Card(page))
+			attempts, sendErr := deliver(ctx, ch.Kind, hook, page)
 			pr.State, pr.Attempts = "sent", attempts
+			if sendErr == nil && ch.Kind == notify.KindTeams {
+				// Teams 回 202 只代表工作流收下了，别和飞书的「已送达」混为一谈
+				pr.Reason = joinReason(pr.Reason, notify.TeamsDeliveredNote)
+			}
 			if sendErr != nil {
 				pr.State, pr.ErrMsg = "failed", sendErr.Error()
 				logx.Warn("notify", "deliver_failed", map[string]any{
@@ -197,6 +201,14 @@ func (c *Collector) notifyExecution(ctx context.Context, execRef int64, p store.
 	}
 }
 
+// joinReason 在原因后面追加一句说明。
+func joinReason(reason, note string) string {
+	if reason == "" {
+		return note
+	}
+	return reason + "；" + note
+}
+
 // pageInterval 分片之间的间隔（飞书限频 5 次/秒）
 const pageInterval = 300 * time.Millisecond
 
@@ -205,10 +217,10 @@ const pageInterval = 300 * time.Millisecond
 // ⚠️ 只重试 3 次、间隔很短：通知的价值随时间衰减，
 // 一条迟到十分钟的失败告警意义已经不大，而卡在这里会拖住整个采集循环。
 // webhook 被重置、机器人被移出群这类错误，重试多少次都是同样结果。
-func deliver(ctx context.Context, webhook string, card map[string]any) (int, error) {
+func deliver(ctx context.Context, kind, webhook string, page notify.Replication) (int, error) {
 	var last error
 	for i := 1; i <= 3; i++ {
-		if err := notify.SendFeishuCard(webhook, card); err == nil {
+		if err := notify.Deliver(kind, webhook, page); err == nil {
 			return i, nil
 		} else {
 			last = err

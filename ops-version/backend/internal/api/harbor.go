@@ -234,6 +234,37 @@ func (s *Server) saveChannel(w http.ResponseWriter, r *http.Request) {
 		fail(w, http.StatusBadRequest, "bad_request", "名称必填")
 		return
 	}
+	kind := req.Kind
+	if kind == "" {
+		kind = notify.KindLark
+	}
+	if !notify.ValidKind(kind) {
+		fail(w, http.StatusBadRequest, "bad_request", "不支持的渠道类型："+kind)
+		return
+	}
+	if kind == notify.KindTeams && req.Webhook != "" {
+		// 去掉复制带进来的不可见字符再校验，存规整后的地址
+		req.Webhook = notify.NormalizeTeamsWebhook(req.Webhook)
+		if err := notify.ValidateTeamsWebhook(req.Webhook); err != nil {
+			fail(w, http.StatusBadRequest, "bad_request", err.Error())
+			return
+		}
+	}
+	if id > 0 && req.Webhook == "" {
+		// 🔴 改了类型却沿用旧地址：飞书的地址会被当成 Teams 地址发（或反过来），必须重填
+		if list, lerr := s.St.ListChannels(r.Context()); lerr == nil {
+			for _, c := range list {
+				if c.ID == id && c.Kind != kind {
+					fail(w, http.StatusBadRequest, "bad_request", "改了渠道类型，请重新填写 Webhook 地址")
+					return
+				}
+			}
+		}
+	}
+	if kind == notify.KindTeams && id == 0 && req.Webhook == "" {
+		fail(w, http.StatusBadRequest, "bad_request", "Teams 渠道必须填写工作流地址")
+		return
+	}
 	enc := ""
 	if req.Webhook != "" {
 		// 🔴 webhook 里带 token，等同于凭据 —— 加密存储，接口永不回显
@@ -242,10 +273,6 @@ func (s *Server) saveChannel(w http.ResponseWriter, r *http.Request) {
 			fail(w, http.StatusInternalServerError, "internal", "加密失败")
 			return
 		}
-	}
-	kind := req.Kind
-	if kind == "" {
-		kind = "lark"
 	}
 	newID, err := s.St.SaveChannel(r.Context(), id, store.ChannelInput{
 		Name: req.Name, Kind: kind, WebhookEnc: enc, Enabled: req.Enabled, OrgID: req.OrgID,
@@ -301,7 +328,7 @@ func (s *Server) testChannel(w http.ResponseWriter, r *http.Request) {
 		fail(w, http.StatusInternalServerError, "internal", "webhook 解密失败")
 		return
 	}
-	sendErr := notify.SendFeishu(hook, "【OpsVersion】测试消息：通知渠道「"+ch.Name+"」配置正常")
+	sendErr := notify.SendTest(ch.Kind, hook, ch.Name)
 	s.St.Audit(r.Context(), userOf(r).Username, "notify.test", ch.Name, nil, sendErr, clientIP(r))
 	if sendErr != nil {
 		// 同上：通知测试失败也是 200，日志里同样会隐身
@@ -310,7 +337,12 @@ func (s *Server) testChannel(w http.ResponseWriter, r *http.Request) {
 		ok(w, map[string]any{"ok": false, "message": sendErr.Error()})
 		return
 	}
-	ok(w, map[string]any{"ok": true, "message": "已发送，去群里确认收到"})
+	msg := "已发送，去群里确认收到"
+	if ch.Kind == notify.KindTeams {
+		// 202 只代表工作流收下了，卡片之后由 Power Automate 发出
+		msg = "Teams 已接收，去群里确认是否收到卡片"
+	}
+	ok(w, map[string]any{"ok": true, "message": msg})
 }
 
 func (s *Server) listNotifyRecords(w http.ResponseWriter, r *http.Request) {

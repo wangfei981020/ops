@@ -730,12 +730,16 @@ func (s *Server) sendReplicationCard(ctx context.Context, p store.PolicyRow,
 			if len(pages) > 1 {
 				r.Reason = fmt.Sprintf("%s（第 %d/%d 页）", reason, i+1, len(pages))
 			}
-			if err := notify.SendFeishuCard(hook, notify.Card(page)); err != nil {
+			if err := notify.Deliver(ch.Kind, hook, page); err != nil {
 				r.State, r.ErrMsg = "failed", err.Error()
 				logx.Warn("webhook", "notify_failed", map[string]any{
 					"channel": ch.Name, "page": i + 1, "pages": len(pages), "err": err.Error()})
 			} else {
 				sent = true
+				if ch.Kind == notify.KindTeams {
+					// Teams 回 202 只代表工作流收下了，别和飞书的「已送达」混为一谈
+					r.Reason = r.Reason + "；" + notify.TeamsDeliveredNote
+				}
 			}
 			_ = s.St.SaveNotifyRecord(ctx, r)
 			// 飞书自定义机器人限频 5 次/秒，分片之间留出间隔

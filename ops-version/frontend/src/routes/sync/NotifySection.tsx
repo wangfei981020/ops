@@ -71,7 +71,12 @@ export function NotifySection({ session }: { session: Session }) {
       accessorFn: (r) => r.name,
       cell: ({ row }) => (
         <div>
-          <div className="text-xs font-semibold text-foreground">{row.original.name}</div>
+          <div className="text-xs font-semibold text-foreground">
+            {row.original.name}{' '}
+            <Badge tone="mute">
+              {row.original.kind === 'teams' ? t('opsversion:notify.kindTeams') : t('opsversion:notify.kindLark')}
+            </Badge>
+          </div>
           <div className="text-[11px] text-muted-foreground">
             {row.original.org_name || t('opsversion:notify.allOrgs')}
           </div>
@@ -362,18 +367,34 @@ function ChannelForm({
           className="w-full rounded-md border border-border bg-background px-2 py-1.5 text-sm text-foreground"
         />
       </label>
+      <div className="mb-2.5">
+        <Select
+          label={t('opsversion:notify.kind')}
+          value={f.kind}
+          onChange={(v) => setF((p) => ({ ...p, kind: v || 'lark' }))}
+          options={[
+            { value: 'lark', label: t('opsversion:notify.kindLark') },
+            { value: 'teams', label: t('opsversion:notify.kindTeams') },
+          ]}
+        />
+      </div>
       <label className="mb-2.5 flex flex-col gap-1">
         <span className="text-xs text-muted-foreground">Webhook</span>
         <input
           type="password"
           value={f.webhook}
-          placeholder="https://open.feishu.cn/open-apis/bot/v2/hook/…"
+          placeholder={
+            f.kind === 'teams'
+              ? 'https://….environment.api.powerplatform.com:443/powerautomate/…'
+              : 'https://open.feishu.cn/open-apis/bot/v2/hook/…'
+          }
           onChange={(e) => setF((p) => ({ ...p, webhook: e.target.value }))}
           className="w-full rounded-md border border-border bg-background px-2 py-1.5 text-sm text-foreground"
         />
         {/* 🔴 webhook 等同于凭据：它一旦泄露，任何人都能往群里发消息 */}
         <span className="text-[11px] text-muted-foreground">
-          {isEdit ? t('opsversion:notify.webhookKeep') : t('opsversion:notify.webhookHint')}
+          {isEdit ? t('opsversion:notify.webhookKeep') : f.kind === 'teams' ? t('opsversion:notify.teamsHint') : t('opsversion:notify.webhookHint')}
+          {isEdit && f.kind !== channel.kind ? ` · ${t('opsversion:notify.kindChangeHint')}` : ''}
         </span>
       </label>
       <div className="mb-2.5">
