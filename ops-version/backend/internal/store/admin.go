@@ -218,15 +218,18 @@ type ComparePlan struct {
 	OnlyDiff bool      `json:"only_diff"`
 	// Ignores 人为忽略项，随方案存。可解除 —— 对方以后上线了这个服务，
 	// 不该逼人重建整个方案。
-	Ignores   compare.IgnoreSet `json:"ignores"`
-	CreatedBy string            `json:"created_by"`
-	CreatedAt time.Time         `json:"created_at"`
+	Ignores compare.IgnoreSet `json:"ignores"`
+	// Services 只比这些服务（服务名，不含通配）。空 = 全部。
+	// 🔴 永远给数组不给 null：前端拿 null 去 .length 会白屏
+	Services  []string  `json:"services"`
+	CreatedBy string    `json:"created_by"`
+	CreatedAt time.Time `json:"created_at"`
 }
 
 func (s *Store) ListPlans(ctx context.Context) ([]ComparePlan, error) {
 	rows, err := s.db.QueryContext(ctx, `
 		SELECT id, name, columns_json, only_diff,
-		       ignores_json, created_by, created_at
+		       ignores_json, services_json, created_by, created_at
 		  FROM comparison_plans WHERE deleted_at IS NULL ORDER BY id DESC`)
 	if err != nil {
 		return nil, err
@@ -236,10 +239,10 @@ func (s *Store) ListPlans(ctx context.Context) ([]ComparePlan, error) {
 	for rows.Next() {
 		var p ComparePlan
 		var cj string
-		var ij sql.NullString
+		var ij, sj sql.NullString
 		var od int
 		if err := rows.Scan(&p.ID, &p.Name, &cj,
-			&od, &ij, &p.CreatedBy, &p.CreatedAt); err != nil {
+			&od, &ij, &sj, &p.CreatedBy, &p.CreatedAt); err != nil {
 			return nil, err
 		}
 		p.OnlyDiff = od == 1
@@ -268,9 +271,48 @@ func (s *Store) ListPlans(ctx context.Context) ([]ComparePlan, error) {
 				p.Ignores.Cells = map[string][]string{}
 			}
 		}
+		p.Services = []string{}
+		if sj.Valid && strings.TrimSpace(sj.String) != "" {
+			// 坏了同样不能静默：变空 = 「比全部」，人会以为方案里的服务范围还在生效
+			if err := json.Unmarshal([]byte(sj.String), &p.Services); err != nil {
+				logx.Warn("store", "plan_services_broken", map[string]any{
+					"plan_id": p.ID, "name": p.Name, "err": err.Error()})
+			}
+			if p.Services == nil {
+				p.Services = []string{}
+			}
+		}
 		out = append(out, p)
 	}
 	return out, rows.Err()
+}
+
+// 方案里服务名的上限。服务名是镜像名最后一段，128 足够；
+// 数量上限防止有人塞一个几万项的数组进来，每次套用方案都要拖着它比对
+const (
+	maxPlanServices   = 1000
+	maxPlanServiceLen = 128
+)
+
+// normPlanServices 去空白、去重、校验长度与数量。
+func normPlanServices(in []string) ([]string, error) {
+	out := make([]string, 0, len(in))
+	seen := map[string]bool{}
+	for _, s := range in {
+		s = strings.TrimSpace(s)
+		if s == "" || seen[s] {
+			continue
+		}
+		if len(s) > maxPlanServiceLen {
+			return nil, fmt.Errorf("服务名过长（上限 %d 字符）", maxPlanServiceLen)
+		}
+		seen[s] = true
+		out = append(out, s)
+	}
+	if len(out) > maxPlanServices {
+		return nil, fmt.Errorf("服务数超过上限 %d", maxPlanServices)
+	}
+	return out, nil
 }
 
 func (s *Store) SavePlan(ctx context.Context, id int64, p ComparePlan, actor string) (int64, error) {
@@ -280,24 +322,29 @@ func (s *Store) SavePlan(ctx context.Context, id int64, p ComparePlan, actor str
 	if len(p.Columns) < 2 {
 		return 0, fmt.Errorf("至少要两列才能对比")
 	}
+	svcs, err := normPlanServices(p.Services)
+	if err != nil {
+		return 0, err
+	}
 	cj, _ := json.Marshal(p.Columns)
 	ij, _ := json.Marshal(p.Ignores)
+	sj, _ := json.Marshal(svcs)
 	if id == 0 {
 		res, err := s.db.ExecContext(ctx, `
 			INSERT INTO comparison_plans (name, columns_json,
-			  only_diff, ignores_json, created_by)
-			VALUES (?,?,?,?,?)`, p.Name, string(cj),
-			boolToInt(p.OnlyDiff), string(ij), actor)
+			  only_diff, ignores_json, services_json, created_by)
+			VALUES (?,?,?,?,?,?)`, p.Name, string(cj),
+			boolToInt(p.OnlyDiff), string(ij), string(sj), actor)
 		if err != nil {
 			return 0, err
 		}
 		return res.LastInsertId()
 	}
-	_, err := s.db.ExecContext(ctx, `
+	_, err = s.db.ExecContext(ctx, `
 		UPDATE comparison_plans SET name=?, columns_json=?,
-		  only_diff=?, ignores_json=?
+		  only_diff=?, ignores_json=?, services_json=?
 		 WHERE id=?`, p.Name, string(cj),
-		boolToInt(p.OnlyDiff), string(ij), id)
+		boolToInt(p.OnlyDiff), string(ij), string(sj), id)
 	return id, err
 }
 

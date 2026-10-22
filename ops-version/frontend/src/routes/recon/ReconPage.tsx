@@ -8,11 +8,13 @@ import {
   Dialog,
   EmptyState,
   fromQuery,
+  MultiSelect,
+  type MultiSelectOption,
   Select,
   TableSkeleton,
 } from '@ops/ui'
-import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
-import { useCallback, useMemo, useState } from 'react'
+import { useMutation, useQueries, useQuery, useQueryClient } from '@tanstack/react-query'
+import { type SetStateAction, useCallback, useMemo, useState } from 'react'
 import { api, download, toLoadError } from '../../lib/api.js'
 import { can, type Session } from '../../lib/session.js'
 import { IgnoreManager } from './IgnoreManager.js'
@@ -42,17 +44,8 @@ interface PlanResp {
   /** ⚠️ 可能是 null：老方案没有忽略规则 */
   ignores: { services: string[] | null; cells: Record<string, string[]> | null } | null
   only_diff: boolean
-}
-
-/**
- * 解析服务白名单输入。逗号、空格、换行都当分隔符 ——
- * 人从别处粘一串服务名过来时，分隔符是什么完全看运气。
- */
-function parseServices(s: string): string[] {
-  return s
-    .split(/[\s,，、]+/)
-    .map((x) => x.trim())
-    .filter(Boolean)
+  /** 只比这些服务。⚠️ 可选：加这个字段之前的后端不返回；空 = 全部 */
+  services?: string[] | null
 }
 
 export function ReconPage({ session }: { session: Session }) {
@@ -82,7 +75,11 @@ export function ReconPage({ session }: { session: Session }) {
   const [err, setErr] = useState('')
   // 只比这些服务。按服务名（镜像名最后一段）—— 那是各平台唯一对得齐的东西，
   // 一份配置对所有平台生效，不用每家各配一遍
-  const [svcFilter, setSvcFilter] = useState('')
+  //
+  // 🔴 从已采集的服务里选，不再让人手打：手打拼错一个字母不会报错，
+  //    只是结果里静默少了那一行 —— 看的人会以为「这个服务两边都没有」。
+  //    空数组 = 全部
+  const [svcPick, setSvcPick] = useState<string[]>([])
   // 结果内的即时筛选。与上面那个「只比这些服务」是两回事：
   // 那个决定「查什么」（要重新请求），这个只是在已经拿到的结果里找 ——
   // 100 多行时想定位某个服务，重新查一次太慢也没必要
@@ -117,6 +114,52 @@ export function ReconPage({ session }: { session: Session }) {
   // ⚠️ 仍然用 null 区分「还没初始化」与「用户主动清空了」——
   //    切换视图层级时要靠它把上一层的勾选清掉（两层的 colKey 不通用）。
   const selected = picked ?? new Set<string>()
+
+  // ─── 服务候选 ───
+  //
+  // 候选 = 已勾选的列里采到过的服务；一列都没勾时给全部平台的，
+  // 好让人「先挑服务、再挑列」也走得通。
+  // ⚠️ 读的是已采集的快照，比对前的自动刷新可能还会多出新服务 —— 那种留空（=全部）就能看到
+  const svcOrgIds = useMemo(() => {
+    const src = selected.size ? choices.filter((c) => selected.has(colKey(c))) : choices
+    return [...new Set(src.map((c) => c.orgId))]
+  }, [choices, selected])
+  const svcQs = useQueries({
+    queries: svcOrgIds.map((id) => ({
+      queryKey: ['org-services', id],
+      queryFn: () => api<{ service_key: string; envs: string[] }[]>(`/api/orgs/${id}/services`),
+      // 勾一列、取消一列都会重新挂这批查询；清单只随采集变，没必要每次都打
+      staleTime: 60_000,
+    })),
+  })
+  const svcOptions = useMemo<MultiSelectOption[]>(() => {
+    // 只算勾选列那个环境的：同一个平台 UAT 有、PROD 没有的服务，只勾了 PROD 时不该出现
+    const envsOf = (orgId: number) =>
+      selected.size
+        ? new Set(
+            choices.filter((c) => c.orgId === orgId && selected.has(colKey(c))).map((c) => c.env),
+          )
+        : null
+    const keys = new Set<string>()
+    svcOrgIds.forEach((id, i) => {
+      const envs = envsOf(id)
+      for (const s of svcQs[i]?.data ?? []) {
+        if (!envs || s.envs.some((e) => envs.has(e))) keys.add(s.service_key)
+      }
+    })
+    // 🔴 已选但当前列里采不到的不能从选项里消失：MultiSelect 只渲染选项，
+    //    它们会变成看不见、却仍然在生效的筛选。标出来，让人自己决定去留。
+    const missing = svcPick.filter((k) => !keys.has(k))
+    return [
+      ...missing.map((k) => ({ value: k, label: `${k}  ${t('opsversion:recon.svcMissing')}` })),
+      ...[...keys].sort().map((k) => ({ value: k, label: k })),
+    ]
+  }, [svcOrgIds, svcQs, choices, selected, svcPick, t])
+  // 改了「比哪些服务」= 改了查什么，旧结果立刻失效
+  const changeSvc = (v: SetStateAction<string[]>) => {
+    setSvcPick(v)
+    invalidateResult()
+  }
 
   // ─── 数据新鲜度 ───
   //
@@ -196,7 +239,7 @@ export function ReconPage({ session }: { session: Session }) {
         body: JSON.stringify({
           columns: cols.map((c) => ({ org_id: c.orgId, project_id: c.projectId, env: c.env })),
           only_diff: onlyDiff,
-          service_include: parseServices(svcFilter),
+          service_include: svcPick,
           ignores: ig.ignores,
         }),
       })
@@ -254,6 +297,8 @@ export function ReconPage({ session }: { session: Session }) {
     }
     setPicked(new Set(p.columns.map(planKey)))
     setOnlyDiff(p.only_diff)
+    // 服务范围跟着方案回来；老方案没有这个字段 = 比全部
+    setSvcPick(p.services ?? [])
     // 忽略规则跟着方案回来 —— 这正是把它存进方案的意义。
     // ⚠️ 后端给的可能是 null（老方案没这个字段），必须兜底。
     ig.setIgnores({
@@ -280,6 +325,7 @@ export function ReconPage({ session }: { session: Session }) {
           // 忽略规则随方案存 —— 这正是它存在的意义：
           // 下次套用这个方案，不必再把「对方不跑这套」重勾一遍
           ignores: ig.ignores,
+          services: svcPick,
         }),
       })
     },
@@ -320,9 +366,16 @@ export function ReconPage({ session }: { session: Session }) {
   //    收到附件的人会把这份全量当成筛过的，或者反过来，两种都会得出错的结论。
   //    （onlyDiff 是后端筛的，result.rows 本身就已经是筛过的，
   //      所以这里只要让它进入 filtering，导出就会跟着走可见行那条路。）
-  const filtering = Boolean(keyword.trim() || verdictPick || onlyDiff)
+  // ⚠️ 只选了部分服务也是筛选：不算进来的话导出文件的「数据说明」页一个字不提，
+  //    收到的人会把十几个服务的表当成全量
+  // 🔴 但导出范围要分开算：服务选择本身就是白名单，直接传；只有结果内的筛选才按可见行导。
+  //    混成一个的话，没出结果就点导出时可见行是空的，空数组到后端 = 全部服务，
+  //    而说明页写着「只比选定的 N 个」—— 文件和说明对不上。
+  const rowFiltering = Boolean(keyword.trim() || verdictPick || onlyDiff)
+  const filtering = rowFiltering || svcPick.length > 0
   const filterDesc = [
     onlyDiff ? t('opsversion:recon.onlyDiffNote') : '',
+    svcPick.length ? t('opsversion:recon.svcNote', { n: svcPick.length }) : '',
     keyword.trim() ? `服务名含「${keyword.trim()}」` : '',
     verdictPick ? `判定为「${t(`opsversion:verdict.${verdictPick}`)}」` : '',
   ]
@@ -347,9 +400,7 @@ export function ReconPage({ session }: { session: Session }) {
           // 🔴 导出的必须是**界面上看到的那些**。
           //    界面筛到 14 行、导出却是 100 行的话，人拿着导出的表去开会，
           //    说的和看的对不上。有筛选时按可见行的服务名导，没筛选时用原白名单。
-          service_include: filtering
-            ? visibleRows.map((r) => r.ServiceKey)
-            : parseServices(svcFilter),
+          service_include: rowFiltering ? visibleRows.map((r) => r.ServiceKey) : svcPick,
           // 🔴 忽略同样要带。不带的话导出的表里会冒出界面上已经忽略掉的行 ——
           //    人拿着这份表去开会，指着一行问「这个怎么回事」，
           //    而那正是他自己标过「不用比」的。
@@ -686,16 +737,6 @@ export function ReconPage({ session }: { session: Session }) {
                 />
                 {t('opsversion:recon.onlyDiff')}
               </label>
-              <input
-                value={svcFilter}
-                onChange={(e) => {
-                  setSvcFilter(e.target.value)
-                  invalidateResult()
-                }}
-                placeholder={t('opsversion:recon.servicePh')}
-                title={t('opsversion:recon.serviceHelp')}
-                className="w-60 rounded-md border border-border bg-background px-2 py-1 text-xs text-foreground"
-              />
               <div className="flex-1" />
               {can(session, 'export') && (
                 <Button onClick={doExport} disabled={exporting}>
@@ -805,6 +846,38 @@ export function ReconPage({ session }: { session: Session }) {
                     </label>
                   )
                 })}
+              </div>
+              {/* 比哪些服务。放在「开始比对」之前选 —— 先定范围再查，
+                  而不是查完一百多行再去结果里找 */}
+              <div className="mt-3 flex flex-wrap items-center gap-2 border-t border-border pt-3">
+                <MultiSelect
+                  label={t('opsversion:recon.svcLabel')}
+                  value={svcPick}
+                  onChange={changeSvc}
+                  options={svcOptions}
+                  placeholder={t('opsversion:recon.svcAll')}
+                  summary={(n, total) => t('opsversion:recon.svcSummary', { n, total })}
+                  searchPlaceholder={t('opsversion:recon.svcSearch')}
+                  clearLabel={t('opsversion:recon.clearAll')}
+                  selectAllLabel={t('opsversion:recon.selectAll')}
+                  emptyLabel={
+                    svcQs.some((q) => q.isPending)
+                      ? t('opsversion:recon.svcLoading')
+                      : t('opsversion:recon.svcEmpty')
+                  }
+                />
+                {/* 选了什么要摊开给人看：下拉收起后只剩「已选 N 个」，看不出是哪几个 */}
+                {svcPick.map((k) => (
+                  <button
+                    key={k}
+                    type="button"
+                    onClick={() => changeSvc((prev) => prev.filter((x) => x !== k))}
+                    title={t('opsversion:recon.svcRemove')}
+                    className="rounded-md border border-border bg-secondary px-1.5 py-0.5 font-mono text-[11px] text-foreground hover:border-border-strong"
+                  >
+                    {k} ×
+                  </button>
+                ))}
               </div>
             </div>
 
