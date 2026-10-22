@@ -26,3 +26,36 @@
 # 所以这不是"暂时豁免"，是长期结论。若哪天真需要 openpgp，
 # 必须删掉这条例外并另找库。
 GO-2026-5932
+
+# CVE-2026-107211 ~ 107225 · github.com/xuri/excelize/v2 v2.11.0（共 15 条）
+#
+# 全部是**读取/解析/计算外部工作簿**路径上的问题：OpenFile/OpenReader、Decrypt、
+# GetRows/Rows、GetStyle、GetSlicers、GetConditionalFormats、CalcCellValue（RIGHT/ANCHORARRAY）、
+# 透视表字段提取、zip64/CFB 解包等，触发前提是喂给它一个攻击者构造的 xlsx。
+#
+# 不适用的依据：本项目只**生成** Excel（导出对账表），从不打开、解析或计算任何外来工作簿。
+#   - 入口只有 excelize.NewFile()（internal/export/export.go、internal/export/inventory.go）
+#   - 没有任何上传 xlsx 的接口；单元格坐标由代码里的固定列字母生成，不接收外部列名
+#
+# 2026-10-22 复核（推 对外仓库 v0.76.0 前）：
+#   grep -rnE 'excelize\.(OpenFile|OpenReader)|CalcCellValue|GetRows|GetStyle\(|GetSlicers|GetConditionalFormats|ColumnNameToNumber' --include='*.go' .
+#     → 只命中测试以外 0 处
+#
+# ⚠️ 为什么不直接升：修复只在上游 master 的未打标签提交里（2.11.1-0.20261003…），
+#    没有正式版本。等 excelize 发 v2.11.1（或更高）正式版就升级并删掉这一段。
+# 🔴 哪天加了「上传/导入 Excel」功能，这段必须先删、先升级，否则就是真漏洞。
+CVE-2026-107211
+CVE-2026-107212
+CVE-2026-107213
+CVE-2026-107214
+CVE-2026-107215
+CVE-2026-107216
+CVE-2026-107217
+CVE-2026-107218
+CVE-2026-107219
+CVE-2026-107220
+CVE-2026-107221
+CVE-2026-107222
+CVE-2026-107223
+CVE-2026-107224
+CVE-2026-107225
