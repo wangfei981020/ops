@@ -21,3 +21,9 @@ overrides:
   # 只是构建期依赖（openapi-typescript 生成 API 类型），不进产物也不进镜像，
   # 但规矩是 audit 清零，不留"这个可以忽略"的先例
   js-yaml: ^4.3.1
+  # 2026-10-22 发布 ops-version v0.76.0 时 pnpm audit 拦下（vitest 已升 4.1.12，剩这两个）：
+  # vite 7.3.6 的 launch-editor / server.fs.allow 等 5 条 → 7.3.7（同大版本补丁）
+  # source-map-js 1.2.1 事件循环 DoS（经 postcss 引入）→ 1.2.2
+  # 都是构建/开发期依赖，不进镜像；规矩同上，audit 清零
+  vite@7: 7.3.7
+  source-map-js: ^1.2.2
