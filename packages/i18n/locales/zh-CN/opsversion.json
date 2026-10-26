@@ -82,6 +82,7 @@
     "svcPastePlaceholder": "app-order-backend\napp-wallet\n…",
     "svcPasteSummary": "已勾选 {{n}} 个服务，{{bad}} 个名字没认出来",
     "svcPasteUnknown": "未识别：",
+    "svcClear": "清空已选（{{n}}）",
     "svcRemove": "点击移除",
     "svcNote": "只比选定的 {{n}} 个服务",
     "mostlyMissing": "这次比对里绝大多数行都判成「缺失」—— 多半是参与对比的列选错了（比如把两批不相干的平台放在了一起），而不是两边真的都没部署。检查一下选了哪几列。",

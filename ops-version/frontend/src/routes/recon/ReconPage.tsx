@@ -14,7 +14,7 @@ import {
   TableSkeleton,
 } from '@ops/ui'
 import { useMutation, useQueries, useQuery, useQueryClient } from '@tanstack/react-query'
-import { ClipboardPaste } from 'lucide-react'
+import { ClipboardPaste, Trash2 } from 'lucide-react'
 import { type SetStateAction, useCallback, useMemo, useState } from 'react'
 import { api, download, toLoadError } from '../../lib/api.js'
 import { can, type Session } from '../../lib/session.js'
@@ -923,6 +923,22 @@ export function ReconPage({ session }: { session: Session }) {
                     {k} ×
                   </button>
                 ))}
+                {/* 一键清空：下拉里的「清空」要先展开才看得到。
+                    清空 = 回到全部服务 = 换了问题，走 changeSvc 清掉旧结果；
+                    粘贴识别结果说的是上一批，一起收掉 */}
+                {svcPick.length > 0 && (
+                  <button
+                    type="button"
+                    onClick={() => {
+                      changeSvc([])
+                      setPasteReport(null)
+                    }}
+                    className="inline-flex items-center gap-1 px-1 py-0.5 text-xs text-muted-foreground hover:text-danger"
+                  >
+                    <Trash2 className="size-3.5" />
+                    {t('opsversion:recon.svcClear', { n: svcPick.length })}
+                  </button>
+                )}
               </div>
               {/* 粘贴识别结果：不完整的名字匹配到了哪些、哪些没认出来，都要摆出来 */}
               {pasteReport && (
