@@ -167,17 +167,17 @@ export function ReconPage({ session }: { session: Session }) {
     setSvcPick(v)
     invalidateResult()
   }
-  // 批量粘贴：粘进来的一串服务名 → 替换当前勾选（「粘一批、比一批」）
-  const [pasteOpen, setPasteOpen] = useState(false)
+  // 服务名输入框：粘贴 = 整批替换（「粘一批、比一批」）；手打回车 = 追加（补一两个）
   const [pasteText, setPasteText] = useState('')
   const [pasteReport, setPasteReport] = useState<PasteResult | null>(null)
-  const applyPaste = () => {
-    const r = matchPaste(pasteText, svcKeys)
+  const applyPaste = (text: string, mode: 'replace' | 'append') => {
+    const r = matchPaste(text, svcKeys)
     setPasteReport(r)
-    setPasteOpen(false)
     setPasteText('')
     // 一个都没认出来时不动现有勾选 —— 清空 = 比全部，那就离题了
-    if (r.picked.length) changeSvc(r.picked)
+    // ⚠️ 原本就没勾选时「不动」仍是全部服务，见 docs/issues/OPSVER-100
+    if (!r.picked.length) return
+    changeSvc(mode === 'append' ? [...new Set([...svcPick, ...r.picked])] : r.picked)
   }
   // 删掉一个已选服务。
   // 🔴 已经出了结果时**不清屏**，直接按剩下的服务重比：其余服务的结果照常留着，
@@ -901,16 +901,27 @@ export function ReconPage({ session }: { session: Session }) {
                       : t('opsversion:recon.svcEmpty')
                   }
                 />
-                {/* 🔴 不能用 ghost：无边框灰字，紧挨着下拉看起来像一段说明文字，不像能点。
-                    品牌色描边而不是实心 —— 实心留给「开始比对」，两个实心就分不出主次 */}
-                <Button
-                  variant="default"
-                  icon={<ClipboardPaste className="size-4" />}
-                  onClick={() => setPasteOpen(true)}
-                  className="border-primary text-primary hover:border-primary hover:bg-secondary"
-                >
-                  {t('opsversion:recon.svcPaste')}
-                </Button>
+                {/* 点进去直接粘贴，不再弹窗。品牌色描边让它和普通输入框区分开。
+                    🔴 粘贴必须自己接：单行 input 会把剪贴板里的换行吞掉，
+                       Teams 里一行一个的服务名会被连成一串，一个都认不出来 */}
+                <label className="relative">
+                  <ClipboardPaste className="pointer-events-none absolute left-2.5 top-1/2 size-4 -translate-y-1/2 text-primary" />
+                  <input
+                    type="text"
+                    value={pasteText}
+                    aria-label={t('opsversion:recon.svcPaste')}
+                    placeholder={t('opsversion:recon.svcPaste')}
+                    onChange={(e) => setPasteText(e.target.value)}
+                    onPaste={(e) => {
+                      e.preventDefault()
+                      applyPaste(e.clipboardData.getData('text'), 'replace')
+                    }}
+                    onKeyDown={(e) => {
+                      if (e.key === 'Enter' && pasteText.trim()) applyPaste(pasteText, 'append')
+                    }}
+                    className="h-8 w-72 rounded-[var(--radius)] border border-primary bg-card pl-8 pr-2.5 text-sm text-foreground placeholder:text-primary focus:outline-none focus:shadow-[0_0_0_2px_var(--ops-accent-ring)]"
+                  />
+                </label>
                 {/* 选了什么要摊开给人看：下拉收起后只剩「已选 N 个」，看不出是哪几个 */}
                 {svcPick.map((k) => (
                   <button
@@ -1234,31 +1245,6 @@ export function ReconPage({ session }: { session: Session }) {
               </label>
             </Dialog>
 
-            <Dialog
-              open={pasteOpen}
-              onClose={() => setPasteOpen(false)}
-              title={t('opsversion:recon.svcPaste')}
-              description={t('opsversion:recon.svcPasteHint')}
-              closeLabel={t('common:action.close')}
-              footer={
-                <>
-                  <Button variant="default" onClick={() => setPasteOpen(false)}>
-                    {t('common:action.cancel')}
-                  </Button>
-                  <Button variant="primary" onClick={applyPaste} disabled={!pasteText.trim()}>
-                    {t('common:action.confirm')}
-                  </Button>
-                </>
-              }
-            >
-              <textarea
-                rows={10}
-                value={pasteText}
-                placeholder={t('opsversion:recon.svcPastePlaceholder')}
-                onChange={(e) => setPasteText(e.target.value)}
-                className="w-full resize-y rounded-md border border-input bg-background px-2.5 py-1.5 font-mono text-[11px] text-foreground"
-              />
-            </Dialog>
             <Dialog
               open={confirmDelPlan}
               onClose={() => setConfirmDelPlan(false)}
