@@ -14,11 +14,13 @@ import {
   TableSkeleton,
 } from '@ops/ui'
 import { useMutation, useQueries, useQuery, useQueryClient } from '@tanstack/react-query'
+import { ClipboardPaste } from 'lucide-react'
 import { type SetStateAction, useCallback, useMemo, useState } from 'react'
 import { api, download, toLoadError } from '../../lib/api.js'
 import { can, type Session } from '../../lib/session.js'
 import { IgnoreManager } from './IgnoreManager.js'
 import { ServiceDrill } from './ServiceDrill.js'
+import { matchPaste, type PasteResult } from './svcPaste.js'
 import {
   type ColumnChoice,
   type CompareResult,
@@ -32,7 +34,6 @@ import {
   stableOf,
 } from './types.js'
 import { loadFreshness, type RefreshOutcome, refreshColumns } from './useFreshness.js'
-import { matchPaste, type PasteResult } from './svcPaste.js'
 import { useIgnores } from './useIgnores.js'
 import { VerdictCell } from './VerdictCell.js'
 import { STAT, STRIPE, VERDICT_ORDER } from './verdict.js'
@@ -900,7 +901,14 @@ export function ReconPage({ session }: { session: Session }) {
                       : t('opsversion:recon.svcEmpty')
                   }
                 />
-                <Button variant="ghost" onClick={() => setPasteOpen(true)}>
+                {/* 🔴 不能用 ghost：无边框灰字，紧挨着下拉看起来像一段说明文字，不像能点。
+                    品牌色描边而不是实心 —— 实心留给「开始比对」，两个实心就分不出主次 */}
+                <Button
+                  variant="default"
+                  icon={<ClipboardPaste className="size-4" />}
+                  onClick={() => setPasteOpen(true)}
+                  className="border-primary text-primary hover:border-primary hover:bg-secondary"
+                >
                   {t('opsversion:recon.svcPaste')}
                 </Button>
                 {/* 选了什么要摊开给人看：下拉收起后只剩「已选 N 个」，看不出是哪几个 */}
