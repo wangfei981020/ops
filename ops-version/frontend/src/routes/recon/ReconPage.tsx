@@ -32,6 +32,7 @@ import {
   stableOf,
 } from './types.js'
 import { loadFreshness, type RefreshOutcome, refreshColumns } from './useFreshness.js'
+import { matchPaste, type PasteResult } from './svcPaste.js'
 import { useIgnores } from './useIgnores.js'
 import { VerdictCell } from './VerdictCell.js'
 import { STAT, STRIPE, VERDICT_ORDER } from './verdict.js'
@@ -132,7 +133,8 @@ export function ReconPage({ session }: { session: Session }) {
       staleTime: 60_000,
     })),
   })
-  const svcOptions = useMemo<MultiSelectOption[]>(() => {
+  // 已勾选列里实际采到的服务（不含「已选但未采到」那些）—— 批量粘贴只在这里面认
+  const svcKeys = useMemo(() => {
     // 只算勾选列那个环境的：同一个平台 UAT 有、PROD 没有的服务，只勾了 PROD 时不该出现
     const envsOf = (orgId: number) =>
       selected.size
@@ -147,18 +149,49 @@ export function ReconPage({ session }: { session: Session }) {
         if (!envs || s.envs.some((e) => envs.has(e))) keys.add(s.service_key)
       }
     })
+    return [...keys].sort()
+  }, [svcOrgIds, svcQs, choices, selected])
+  const svcOptions = useMemo<MultiSelectOption[]>(() => {
+    const keys = new Set(svcKeys)
     // 🔴 已选但当前列里采不到的不能从选项里消失：MultiSelect 只渲染选项，
     //    它们会变成看不见、却仍然在生效的筛选。标出来，让人自己决定去留。
     const missing = svcPick.filter((k) => !keys.has(k))
     return [
       ...missing.map((k) => ({ value: k, label: `${k}  ${t('opsversion:recon.svcMissing')}` })),
-      ...[...keys].sort().map((k) => ({ value: k, label: k })),
+      ...svcKeys.map((k) => ({ value: k, label: k })),
     ]
-  }, [svcOrgIds, svcQs, choices, selected, svcPick, t])
+  }, [svcKeys, svcPick, t])
   // 改了「比哪些服务」= 改了查什么，旧结果立刻失效
   const changeSvc = (v: SetStateAction<string[]>) => {
     setSvcPick(v)
     invalidateResult()
+  }
+  // 批量粘贴：粘进来的一串服务名 → 替换当前勾选（「粘一批、比一批」）
+  const [pasteOpen, setPasteOpen] = useState(false)
+  const [pasteText, setPasteText] = useState('')
+  const [pasteReport, setPasteReport] = useState<PasteResult | null>(null)
+  const applyPaste = () => {
+    const r = matchPaste(pasteText, svcKeys)
+    setPasteReport(r)
+    setPasteOpen(false)
+    setPasteText('')
+    // 一个都没认出来时不动现有勾选 —— 清空 = 比全部，那就离题了
+    if (r.picked.length) changeSvc(r.picked)
+  }
+  // 删掉一个已选服务。
+  // 🔴 已经出了结果时**不清屏**，直接按剩下的服务重比：其余服务的结果照常留着，
+  //    不用再点一次「开始比对」。summary / mostly_missing 是后端按整批算的，
+  //    只在前端删行的话那几个数会对不上，所以走一次请求而不是本地过滤。
+  // ⚠️ 删到一个不剩 = 比全部服务，那是换了问题，按老规矩清掉结果
+  const removeSvc = (k: string) => {
+    const next = svcPick.filter((x) => x !== k)
+    if (!result || next.length === 0) {
+      changeSvc(next)
+      return
+    }
+    setSvcPick(next)
+    if (drill?.ServiceKey === k) setDrill(null)
+    compare.mutate(next)
   }
 
   // ─── 数据新鲜度 ───
@@ -229,7 +262,8 @@ export function ReconPage({ session }: { session: Session }) {
   )
 
   const compare = useMutation({
-    mutationFn: async () => {
+    // 不传 = 用当前勾选；删服务时 state 还没刷新，要把新的那组显式带进来
+    mutationFn: async (svc?: string[]) => {
       const cols = choices.filter((c) => selected.has(colKey(c)))
       // 没有可比的列时直接拒绝，别发一个注定 400 的请求
       if (cols.length === 0) throw new Error('no column selected')
@@ -239,7 +273,7 @@ export function ReconPage({ session }: { session: Session }) {
         body: JSON.stringify({
           columns: cols.map((c) => ({ org_id: c.orgId, project_id: c.projectId, env: c.env })),
           only_diff: onlyDiff,
-          service_include: svcPick,
+          service_include: svc ?? svcPick,
           ignores: ig.ignores,
         }),
       })
@@ -866,12 +900,15 @@ export function ReconPage({ session }: { session: Session }) {
                       : t('opsversion:recon.svcEmpty')
                   }
                 />
+                <Button variant="ghost" onClick={() => setPasteOpen(true)}>
+                  {t('opsversion:recon.svcPaste')}
+                </Button>
                 {/* 选了什么要摊开给人看：下拉收起后只剩「已选 N 个」，看不出是哪几个 */}
                 {svcPick.map((k) => (
                   <button
                     key={k}
                     type="button"
-                    onClick={() => changeSvc((prev) => prev.filter((x) => x !== k))}
+                    onClick={() => removeSvc(k)}
                     title={t('opsversion:recon.svcRemove')}
                     className="rounded-md border border-border bg-secondary px-1.5 py-0.5 font-mono text-[11px] text-foreground hover:border-border-strong"
                   >
@@ -879,6 +916,35 @@ export function ReconPage({ session }: { session: Session }) {
                   </button>
                 ))}
               </div>
+              {/* 粘贴识别结果：不完整的名字匹配到了哪些、哪些没认出来，都要摆出来 */}
+              {pasteReport && (
+                <div className="mt-2 rounded-md border border-border bg-secondary px-2.5 py-2 text-xs text-foreground">
+                  <div className="flex items-center justify-between gap-2">
+                    <span>
+                      {t('opsversion:recon.svcPasteSummary', {
+                        n: pasteReport.picked.length,
+                        bad: pasteReport.unknown.length,
+                      })}
+                    </span>
+                    <Button variant="ghost" size="sm" onClick={() => setPasteReport(null)}>
+                      {t('common:action.close')}
+                    </Button>
+                  </div>
+                  {pasteReport.hits
+                    .filter((h) => !h.exact)
+                    .map((h) => (
+                      <div key={h.input} className="mt-1 font-mono text-[11px]">
+                        {h.input} → {h.matched.join('、')}
+                      </div>
+                    ))}
+                  {pasteReport.unknown.length > 0 && (
+                    <div className="mt-1 text-[11px] text-danger">
+                      {t('opsversion:recon.svcPasteUnknown')}
+                      <span className="font-mono">{pasteReport.unknown.join('、')}</span>
+                    </div>
+                  )}
+                </div>
+              )}
             </div>
 
             {/* 🔴 几乎全是「没有」时提醒列可能选错了。
@@ -1144,6 +1210,31 @@ export function ReconPage({ session }: { session: Session }) {
               </label>
             </Dialog>
 
+            <Dialog
+              open={pasteOpen}
+              onClose={() => setPasteOpen(false)}
+              title={t('opsversion:recon.svcPaste')}
+              description={t('opsversion:recon.svcPasteHint')}
+              closeLabel={t('common:action.close')}
+              footer={
+                <>
+                  <Button variant="default" onClick={() => setPasteOpen(false)}>
+                    {t('common:action.cancel')}
+                  </Button>
+                  <Button variant="primary" onClick={applyPaste} disabled={!pasteText.trim()}>
+                    {t('common:action.confirm')}
+                  </Button>
+                </>
+              }
+            >
+              <textarea
+                rows={10}
+                value={pasteText}
+                placeholder={t('opsversion:recon.svcPastePlaceholder')}
+                onChange={(e) => setPasteText(e.target.value)}
+                className="w-full resize-y rounded-md border border-input bg-background px-2.5 py-1.5 font-mono text-[11px] text-foreground"
+              />
+            </Dialog>
             <Dialog
               open={confirmDelPlan}
               onClose={() => setConfirmDelPlan(false)}
